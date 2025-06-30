@@ -1,0 +1,179 @@
+GAME API DOCUMENTATION
+====================
+
+Base URL: http://localhost:8000
+
+OVERVIEW
+--------
+This is a 20x20 grid-based exploration game where players move around a map with different land types.
+Each player has a deterministic starting position based on their wallet address + reveal seed.
+Players can only see a 3x3 local view centered on their current position.
+
+LAND TYPES
+----------
+1 = Common land
+2 = Uncommon land  
+3 = Rare land
+X = Starting position marker
+
+MOVEMENT DIRECTIONS
+------------------
+Valid directions: north, south, east, west, northeast, northwest, southeast, southwest
+
+API ENDPOINTS
+=============
+
+1. GET /status
+--------------
+Get overall game status and server info.
+
+Response:
+{
+  "success": true,
+  "gameLoaded": true,
+  "mapSize": 20,
+  "totalPlayers": 2,
+  "players": ["0x05937Df8ca0636505d92Fd769d303A3D461587ed", "0x1a39C55e6333025A3Be3768873C846632ACDb6f5"],
+  "revealSeed": "0x5d1fea4f13119a5c07e66d501706ea199ab91c3b1a0da9b7f087e22cd675524c",
+  "serverTime": "2025-06-29T11:55:03.109Z"
+}
+
+2. GET /map/:address
+--------------------
+Get the 3x3 local map view for a specific player.
+
+Parameters:
+- address: Ethereum wallet address (in URL path)
+
+Example: GET /map/0x05937Df8ca0636505d92Fd769d303A3D461587ed
+
+Response:
+{
+  "success": true,
+  "player": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
+  "localView": [
+    [
+      {"tile": 1, "player": false},
+      {"tile": 1, "player": false}, 
+      {"tile": 3, "player": false}
+    ],
+    [
+      {"tile": 2, "player": false},
+      {"tile": 1, "player": true},
+      {"tile": 1, "player": false}
+    ],
+    [
+      {"tile": 1, "player": false},
+      {"tile": 1, "player": false},
+      null
+    ]
+  ],
+  "position": {"x": 18, "y": 3},
+  "mapSize": 20,
+  "legend": {
+    "1": "Common",
+    "2": "Uncommon",
+    "3": "Rare",
+    "X": "Starting Position"
+  }
+}
+
+Notes:
+- localView is a 3x3 array with player at center [1][1]
+- null values indicate out-of-bounds areas
+- "player": true marks the player's current position
+
+3. POST /move/:address
+----------------------
+Move a player in a specified direction.
+
+Parameters:
+- address: Ethereum wallet address (in URL path)
+
+Request Body:
+{
+  "direction": "north|south|east|west|northeast|northwest|southeast|southwest"
+}
+
+Example: POST /move/0x05937Df8ca0636505d92Fd769d303A3D461587ed
+Body: {"direction": "west"}
+
+Response:
+{
+  "success": true,
+  "player": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
+  "direction": "west",
+  "newPosition": {"x": 17, "y": 3},
+  "tile": 2,
+  "localView": [
+    [
+      {"tile": 1, "player": false},
+      {"tile": 1, "player": false},
+      {"tile": 1, "player": false}
+    ],
+    [
+      {"tile": 1, "player": false},
+      {"tile": 2, "player": true},
+      {"tile": 1, "player": false}
+    ],
+    [
+      {"tile": 1, "player": false},
+      {"tile": 1, "player": false},
+      {"tile": 1, "player": false}
+    ]
+  ],
+  "validDirections": ["north", "south", "east", "west", "northeast", "northwest", "southeast", "southwest"]
+}
+
+Error Response (if move invalid):
+{
+  "error": "Cannot move outside map bounds"
+}
+
+4. GET /players
+---------------
+Get all player positions and current tiles.
+
+Response:
+{
+  "success": true,
+  "players": [
+    {
+      "address": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
+      "position": {"x": 18, "y": 3},
+      "tile": 2
+    },
+    {
+      "address": "0x1a39C55e6333025A3Be3768873C846632ACDb6f5", 
+      "position": {"x": 5, "y": 10},
+      "tile": 1
+    }
+  ],
+  "count": 2
+}
+
+GAME MECHANICS
+==============
+- Map is 20x20 grid (coordinates 0-19)
+- Players start at deterministic positions based on their address + reveal seed
+- Players can move one square at a time in 8 directions
+- Movement is blocked at map boundaries
+- No collision detection between players
+- No authentication required - just pass address as URL parameter
+
+ERROR HANDLING
+==============
+- Invalid direction: {"error": "Invalid direction"}
+- Player not found: {"error": "Player not found"} (404 status)
+- Out of bounds move: {"error": "Cannot move outside map bounds"}
+- Missing parameters: {"error": "Player address required"} or {"error": "Direction required"}
+
+SAMPLE CLIENT FLOW
+==================
+1. GET /status - Check if game is loaded
+2. GET /map/:address - Get initial position and local view
+3. POST /move/:address - Make moves based on strategy
+4. Repeat step 3 to explore the map
+5. GET /players - Check other players' positions (optional)
+
+All responses include "success": true on successful operations. 
