@@ -1,13 +1,30 @@
 import express from "express";
 import fs from "fs";
 import crypto from "crypto";
+import jwt from "jsonwebtoken";
 import { createPublicClientForChain } from "./clients.js";
+import { verifyMessage } from "viem";
 import dotenv from "dotenv";
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
+
+// JWT Configuration
+const BASE_JWT_SECRET =
+  process.env.JWT_SECRET || "your-secret-key-change-this-in-production";
+const JWT_EXPIRES_IN = "1h";
+
+// Make JWT secret contract-specific by including contract address
+function getJWTSecret() {
+  const contractAddress = process.env.CONTRACT_ADDRESS;
+  if (!contractAddress) {
+    throw new Error("CONTRACT_ADDRESS not found in .env file");
+  }
+  // Combine base secret with contract address to make it contract-specific
+  return BASE_JWT_SECRET + "-" + contractAddress.toLowerCase();
+}
 
 // Enable CORS for all routes
 app.use((req, res, next) => {
@@ -50,7 +67,20 @@ const GAME_MANAGEMENT_ABI = [
 let gameMap = null;
 let players = [];
 let playerPositions = new Map(); // Map of address -> {x, y}
+let playerStats = new Map(); // Map of address -> {score, movesRemaining, minesRemaining}
 let revealSeed = null;
+
+// Game constants
+const MAX_MOVES = 12;
+const MAX_MINES = 3;
+
+// Scoring system based on land types
+const TILE_POINTS = {
+  0: 0, // Depleted (already mined) = 0 points
+  1: 1, // Common = 1 point
+  2: 5, // Uncommon = 5 points
+  3: 10, // Rare = 10 points
+};
 
 // Direction mappings for movement
 const DIRECTIONS = {
@@ -63,6 +93,67 @@ const DIRECTIONS = {
   southeast: { x: 1, y: 1 },
   southwest: { x: -1, y: 1 },
 };
+
+// Authentication helpers
+function generateSignMessage(providedTimestamp = null) {
+  const contractAddress = process.env.CONTRACT_ADDRESS;
+  const timestamp = providedTimestamp || Date.now();
+
+  const message = `Sign this message to authenticate with the game server.\n\nContract: ${contractAddress}\nNamespace: ScriptGame\nTimestamp: ${timestamp}\n\nThis signature is valid for 5 minutes.`;
+
+  console.log("📝 generateSignMessage() called");
+  console.log("   - Contract:", contractAddress);
+  console.log("   - Timestamp:", timestamp);
+  console.log("   - Provided timestamp:", providedTimestamp);
+  console.log("   - Message length:", message.length);
+
+  return message;
+}
+
+function isValidPlayer(address) {
+  return players.some(
+    (player) => player.toLowerCase() === address.toLowerCase()
+  );
+}
+
+// Authentication middleware
+function authenticateToken(req, res, next) {
+  console.log(`\n🔑 Authenticating request to ${req.method} ${req.path}`);
+
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
+
+  console.log("📋 Auth header:", authHeader ? "Bearer [token]" : "MISSING");
+  console.log(
+    "🎫 Token (first 20 chars):",
+    token ? token.substring(0, 20) + "..." : "NONE"
+  );
+
+  if (!token) {
+    console.log("❌ No token provided");
+    return res.status(401).json({ error: "Access token required" });
+  }
+
+  jwt.verify(token, getJWTSecret(), (err, decoded) => {
+    if (err) {
+      console.log("❌ JWT verification failed:", err.message);
+      return res.status(403).json({ error: "Invalid or expired token" });
+    }
+
+    console.log("✅ JWT verified successfully");
+    console.log("📋 Decoded token:", decoded);
+
+    // Verify the address is still a valid player
+    if (!isValidPlayer(decoded.address)) {
+      console.log("❌ Player no longer registered:", decoded.address);
+      return res.status(403).json({ error: "Player no longer registered" });
+    }
+
+    console.log("✅ Player still registered:", decoded.address);
+    req.playerAddress = decoded.address;
+    next();
+  });
+}
 
 // Load game map from file
 function loadGameMap() {
@@ -130,10 +221,19 @@ async function loadPlayers() {
     // Generate starting positions for each player
     players = contractPlayers;
     playerPositions.clear();
+    playerStats.clear();
 
     contractPlayers.forEach((playerAddress) => {
       const startPos = generateStartingPosition(playerAddress);
       playerPositions.set(playerAddress.toLowerCase(), startPos);
+
+      // Initialize player stats
+      playerStats.set(playerAddress.toLowerCase(), {
+        score: 0,
+        movesRemaining: MAX_MOVES,
+        minesRemaining: MAX_MINES,
+      });
+
       console.log(
         `🎯 Player ${playerAddress}: starting at (${startPos.x}, ${startPos.y})`
       );
@@ -194,6 +294,16 @@ function movePlayer(playerAddress, direction) {
     return { success: false, error: "Player not found" };
   }
 
+  const stats = playerStats.get(playerAddress.toLowerCase());
+  if (!stats) {
+    return { success: false, error: "Player stats not found" };
+  }
+
+  // Check if player has moves remaining
+  if (stats.movesRemaining <= 0) {
+    return { success: false, error: "No moves remaining" };
+  }
+
   const dirVector = DIRECTIONS[direction.toLowerCase()];
   if (!dirVector) {
     return { success: false, error: "Invalid direction" };
@@ -206,27 +316,190 @@ function movePlayer(playerAddress, direction) {
   // Update position
   playerPositions.set(playerAddress.toLowerCase(), { x: newX, y: newY });
 
+  // Decrement moves remaining
+  stats.movesRemaining--;
+  playerStats.set(playerAddress.toLowerCase(), stats);
+
   return {
     success: true,
     newPosition: { x: newX, y: newY },
     tile: gameMap.land[newY][newX],
+    movesRemaining: stats.movesRemaining,
+    minesRemaining: stats.minesRemaining,
+    score: stats.score,
+  };
+}
+
+// Mine at current player position
+function minePlayer(playerAddress) {
+  const currentPos = playerPositions.get(playerAddress.toLowerCase());
+  if (!currentPos) {
+    return { success: false, error: "Player not found" };
+  }
+
+  const stats = playerStats.get(playerAddress.toLowerCase());
+  if (!stats) {
+    return { success: false, error: "Player stats not found" };
+  }
+
+  // Check if player has mines remaining
+  if (stats.minesRemaining <= 0) {
+    return { success: false, error: "No mines remaining" };
+  }
+
+  // Get current tile and calculate points
+  const currentTile = gameMap.land[currentPos.y][currentPos.x];
+
+  // Check if tile is already depleted (0 = already mined)
+  if (currentTile === 0) {
+    return { success: false, error: "Tile already mined" };
+  }
+
+  const pointsEarned = TILE_POINTS[currentTile] || 0;
+
+  // Update player stats
+  stats.score += pointsEarned;
+  stats.minesRemaining--;
+  playerStats.set(playerAddress.toLowerCase(), stats);
+
+  // Deplete the tile (set to 0) after mining
+  gameMap.land[currentPos.y][currentPos.x] = 0;
+
+  return {
+    success: true,
+    position: currentPos,
+    tile: currentTile,
+    pointsEarned: pointsEarned,
+    totalScore: stats.score,
+    minesRemaining: stats.minesRemaining,
+    movesRemaining: stats.movesRemaining,
   };
 }
 
 // API Routes
 
-// GET /map/:address - Get 3x3 local map view for player
-app.get("/map/:address", (req, res) => {
-  const playerAddress = req.params.address;
+// GET /register - Get message to sign for authentication
+app.get("/register", (req, res) => {
+  const timestamp = Date.now();
+  const message = generateSignMessage(timestamp);
 
-  if (!playerAddress) {
-    return res.status(400).json({ error: "Player address required" });
+  console.log("\n🔐 GET /register - Generating sign message");
+  console.log("📝 Message to sign:", message);
+  console.log("📍 Contract address:", process.env.CONTRACT_ADDRESS);
+
+  res.json({
+    success: true,
+    message: message,
+    timestamp: timestamp,
+    instructions: "Sign this message with your Ethereum wallet to authenticate",
+  });
+});
+
+// POST /register - Verify signature and issue JWT token
+app.post("/register", async (req, res) => {
+  const { signature, address, timestamp } = req.body;
+
+  console.log("\n🔏 POST /register - Received authentication request");
+  console.log("📧 Address:", address);
+  console.log("✍️  Signature:", signature);
+  console.log("⏰ Timestamp:", timestamp);
+
+  if (!signature || !address || !timestamp) {
+    console.log("❌ Missing signature, address, or timestamp");
+    return res.status(400).json({
+      error: "Signature, address, and timestamp are required",
+    });
   }
+
+  // Check if address is a valid player
+  console.log("🔍 Checking if address is valid player...");
+  console.log("👥 Registered players:", players);
+
+  if (!isValidPlayer(address)) {
+    console.log("❌ Address not found in player list");
+    return res.status(403).json({
+      error: "Address is not registered as a player",
+    });
+  }
+
+  console.log("✅ Address is a valid player");
+
+  try {
+    // Generate the same message that should have been signed using the provided timestamp
+    const message = generateSignMessage(parseInt(timestamp));
+
+    console.log("📝 Generated message for verification:", message);
+    console.log("🔍 Verifying signature...");
+    console.log("   - Address:", address);
+    console.log("   - Message length:", message.length);
+    console.log("   - Signature length:", signature.length);
+
+    // Verify the signature
+    const isValid = await verifyMessage({
+      address: address,
+      message: message,
+      signature: signature,
+    });
+
+    console.log("🔒 Signature verification result:", isValid);
+
+    if (!isValid) {
+      console.log("❌ Signature verification failed");
+      return res.status(401).json({
+        error: "Invalid signature",
+      });
+    }
+
+    console.log("✅ Signature verified successfully");
+
+    // Generate JWT token
+    const tokenPayload = {
+      address: address.toLowerCase(),
+      timestamp: Date.now(),
+    };
+
+    console.log("🎫 Generating JWT token with payload:", tokenPayload);
+
+    const token = jwt.sign(tokenPayload, getJWTSecret(), {
+      expiresIn: JWT_EXPIRES_IN,
+    });
+
+    console.log("✅ JWT token generated successfully");
+    console.log("🎫 Token (first 20 chars):", token.substring(0, 20) + "...");
+
+    res.json({
+      success: true,
+      token: token,
+      expiresIn: JWT_EXPIRES_IN,
+      message: "Authentication successful",
+    });
+  } catch (error) {
+    console.error("❌ Signature verification error:", error);
+    console.error("   Error details:", error.message);
+    console.error("   Error stack:", error.stack);
+    res.status(500).json({
+      error: "Failed to verify signature",
+    });
+  }
+});
+
+// GET /map - Get 3x3 local map view for authenticated player
+app.get("/map", authenticateToken, (req, res) => {
+  const playerAddress = req.playerAddress;
+
+  console.log("🗺️  GET /map - Getting map view for player:", playerAddress);
 
   const localView = getLocalMapView(playerAddress);
   if (!localView) {
+    console.log("❌ Local view not found for player:", playerAddress);
     return res.status(404).json({ error: "Player not found" });
   }
+
+  console.log("✅ Map view generated successfully");
+  console.log("   - Position:", localView.position);
+  console.log("   - Map size:", localView.mapSize);
+
+  const stats = playerStats.get(playerAddress.toLowerCase());
 
   res.json({
     success: true,
@@ -234,33 +507,43 @@ app.get("/map/:address", (req, res) => {
     localView: localView.view,
     position: localView.position,
     mapSize: localView.mapSize,
+    score: stats ? stats.score : 0,
+    movesRemaining: stats ? stats.movesRemaining : 0,
+    minesRemaining: stats ? stats.minesRemaining : 0,
     legend: {
-      1: "Common",
-      2: "Uncommon",
-      3: "Rare",
+      0: "Depleted (already mined)",
+      1: "Common (1 point)",
+      2: "Uncommon (5 points)",
+      3: "Rare (10 points)",
       X: "Starting Position",
     },
   });
 });
 
-// POST /move/:address - Move player in specified direction
-app.post("/move/:address", (req, res) => {
-  const playerAddress = req.params.address;
+// POST /move - Move authenticated player in specified direction
+app.post("/move", authenticateToken, (req, res) => {
+  const playerAddress = req.playerAddress;
   const { direction } = req.body;
 
-  if (!playerAddress) {
-    return res.status(400).json({ error: "Player address required" });
-  }
+  console.log(
+    `🏃 POST /move - Player ${playerAddress} wants to move ${direction}`
+  );
 
   if (!direction) {
+    console.log("❌ No direction provided");
     return res.status(400).json({ error: "Direction required" });
   }
 
   const moveResult = movePlayer(playerAddress, direction);
 
   if (!moveResult.success) {
+    console.log("❌ Move failed:", moveResult.error);
     return res.status(400).json({ error: moveResult.error });
   }
+
+  console.log("✅ Move successful");
+  console.log("   - New position:", moveResult.newPosition);
+  console.log("   - New tile:", moveResult.tile);
 
   // Return updated local view after move
   const localView = getLocalMapView(playerAddress);
@@ -272,7 +555,45 @@ app.post("/move/:address", (req, res) => {
     newPosition: moveResult.newPosition,
     tile: moveResult.tile,
     localView: localView.view,
+    score: moveResult.score,
+    movesRemaining: moveResult.movesRemaining,
+    minesRemaining: moveResult.minesRemaining,
     validDirections: Object.keys(DIRECTIONS),
+  });
+});
+
+// POST /mine - Mine at current position for points
+app.post("/mine", authenticateToken, (req, res) => {
+  const playerAddress = req.playerAddress;
+
+  console.log(`⛏️ POST /mine - Player ${playerAddress} wants to mine`);
+
+  const mineResult = minePlayer(playerAddress);
+
+  if (!mineResult.success) {
+    console.log("❌ Mine failed:", mineResult.error);
+    return res.status(400).json({ error: mineResult.error });
+  }
+
+  console.log("✅ Mine successful");
+  console.log("   - Position:", mineResult.position);
+  console.log("   - Tile:", mineResult.tile);
+  console.log("   - Points earned:", mineResult.pointsEarned);
+  console.log("   - Total score:", mineResult.totalScore);
+
+  // Return updated local view after mining
+  const localView = getLocalMapView(playerAddress);
+
+  res.json({
+    success: true,
+    player: playerAddress,
+    position: mineResult.position,
+    tile: mineResult.tile,
+    pointsEarned: mineResult.pointsEarned,
+    totalScore: mineResult.totalScore,
+    movesRemaining: mineResult.movesRemaining,
+    minesRemaining: mineResult.minesRemaining,
+    localView: localView.view,
   });
 });
 
@@ -289,17 +610,21 @@ app.get("/status", (req, res) => {
   });
 });
 
-// GET /players - Get all player positions
+// GET /players - Get all player positions and stats
 app.get("/players", (req, res) => {
   const playerData = [];
 
   players.forEach((address) => {
     const position = playerPositions.get(address.toLowerCase());
-    if (position) {
+    const stats = playerStats.get(address.toLowerCase());
+    if (position && stats) {
       playerData.push({
         address: address,
         position: position,
         tile: gameMap.land[position.y][position.x],
+        score: stats.score,
+        movesRemaining: stats.movesRemaining,
+        minesRemaining: stats.minesRemaining,
       });
     }
   });
@@ -341,14 +666,36 @@ async function initializeGame() {
     console.log(`📊 Map size: ${gameMap.size}x${gameMap.size}`);
     console.log(`👥 Players loaded: ${players.length}`);
     console.log(`🔑 Reveal seed: ${revealSeed.substring(0, 10)}...`);
-    console.log("\n📡 API Endpoints:");
+    console.log(`🏠 Contract address: ${process.env.CONTRACT_ADDRESS}`);
     console.log(
-      `GET  http://localhost:${PORT}/map/:address     - Get 3x3 local view`
+      `🔐 JWT secret configured: ${
+        process.env.JWT_SECRET ? "YES" : "NO"
+      } (contract-specific)`
     );
-    console.log(`POST http://localhost:${PORT}/move/:address    - Move player`);
+    console.log(`\n🎮 Game Rules:`);
+    console.log(`   - Max moves per player: ${MAX_MOVES}`);
+    console.log(`   - Max mines per player: ${MAX_MINES}`);
+    console.log(`   - Scoring: Common=1pt, Uncommon=5pts, Rare=10pts`);
+    console.log("\n📡 API Endpoints:");
+    console.log("Authentication:");
+    console.log(
+      `GET  http://localhost:${PORT}/register         - Get message to sign`
+    );
+    console.log(
+      `POST http://localhost:${PORT}/register         - Submit signature for JWT`
+    );
+    console.log("\nProtected (require JWT token):");
+    console.log(
+      `GET  http://localhost:${PORT}/map              - Get 3x3 local view + stats`
+    );
+    console.log(`POST http://localhost:${PORT}/move             - Move player`);
+    console.log(
+      `POST http://localhost:${PORT}/mine             - Mine for points`
+    );
+    console.log("\nPublic:");
     console.log(`GET  http://localhost:${PORT}/status           - Game status`);
     console.log(
-      `GET  http://localhost:${PORT}/players          - All player positions`
+      `GET  http://localhost:${PORT}/players          - All player positions + stats`
     );
     console.log("\n✅ Server ready!");
   });

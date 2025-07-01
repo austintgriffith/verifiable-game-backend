@@ -9,11 +9,32 @@ This is a 20x20 grid-based exploration game where players move around a map with
 Each player has a deterministic starting position based on their wallet address + reveal seed.
 Players can only see a 3x3 local view centered on their current position.
 
+GAME CONSTRAINTS
+----------------
+- Each player has a maximum of 12 moves per game
+- Each player can mine a maximum of 3 times per game
+- Players accumulate score by mining on different land types
+- Once moves or mines are exhausted, players cannot perform those actions
+
+SCORING SYSTEM
+--------------
+Land types have different point values when mined:
+- Common land (1): 1 point
+- Uncommon land (2): 5 points  
+- Rare land (3): 10 points
+
+AUTHENTICATION
+--------------
+The API uses JWT (JSON Web Token) authentication with Ethereum signature verification.
+Players must sign a message with their wallet to get a JWT token that expires in 1 hour.
+Protected endpoints require the Authorization header: "Bearer <token>"
+
 LAND TYPES
 ----------
-1 = Common land
-2 = Uncommon land  
-3 = Rare land
+0 = Depleted land (already mined, 0 points)
+1 = Common land (1 point when mined)
+2 = Uncommon land (5 points when mined)
+3 = Rare land (10 points when mined)
 X = Starting position marker
 
 MOVEMENT DIRECTIONS
@@ -23,7 +44,49 @@ Valid directions: north, south, east, west, northeast, northwest, southeast, sou
 API ENDPOINTS
 =============
 
-1. GET /status
+AUTHENTICATION ENDPOINTS
+------------------------
+
+1. GET /register
+----------------
+Get the message that needs to be signed for authentication.
+
+Response:
+{
+  "success": true,
+  "message": "Sign this message to authenticate with the game server.\n\nContract: 0x123...\nNamespace: ScriptGame\nTimestamp: 1234567890\n\nThis signature is valid for 5 minutes.",
+  "timestamp": 1234567890,
+  "instructions": "Sign this message with your Ethereum wallet to authenticate"
+}
+
+2. POST /register
+-----------------
+Submit the signature to get a JWT token.
+
+Request Body:
+{
+  "signature": "0x1234567890abcdef...",
+  "address": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
+  "timestamp": 1234567890
+}
+
+Response (Success):
+{
+  "success": true,
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "expiresIn": "1h",
+  "message": "Authentication successful"
+}
+
+Response (Error):
+{
+  "error": "Invalid signature"
+}
+
+PUBLIC ENDPOINTS
+----------------
+
+3. GET /status
 --------------
 Get overall game status and server info.
 
@@ -38,14 +101,19 @@ Response:
   "serverTime": "2025-06-29T11:55:03.109Z"
 }
 
-2. GET /map/:address
---------------------
-Get the 3x3 local map view for a specific player.
 
-Parameters:
-- address: Ethereum wallet address (in URL path)
 
-Example: GET /map/0x05937Df8ca0636505d92Fd769d303A3D461587ed
+PROTECTED ENDPOINTS (Require JWT Token)
+---------------------------------------
+
+5. GET /map
+-----------
+Get the 3x3 local map view for the authenticated player plus current stats.
+
+Headers:
+Authorization: Bearer <jwt_token>
+
+Example: GET /map
 
 Response:
 {
@@ -53,49 +121,53 @@ Response:
   "player": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
   "localView": [
     [
-      {"tile": 1, "player": false},
-      {"tile": 1, "player": false}, 
-      {"tile": 3, "player": false}
+      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 2}}, 
+      {"tile": 3, "player": false, "coordinates": {"x": 19, "y": 2}}
     ],
     [
-      {"tile": 2, "player": false},
-      {"tile": 1, "player": true},
-      {"tile": 1, "player": false}
+      {"tile": 2, "player": false, "coordinates": {"x": 17, "y": 3}},
+      {"tile": 1, "player": true, "coordinates": {"x": 18, "y": 3}},
+      {"tile": 1, "player": false, "coordinates": {"x": 19, "y": 3}}
     ],
     [
-      {"tile": 1, "player": false},
-      {"tile": 1, "player": false},
-      null
+      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 4}},
+      {"tile": 2, "player": false, "coordinates": {"x": 19, "y": 4}}
     ]
   ],
   "position": {"x": 18, "y": 3},
   "mapSize": 20,
+  "score": 15,
+  "movesRemaining": 8,
+  "minesRemaining": 1,
   "legend": {
-    "1": "Common",
-    "2": "Uncommon",
-    "3": "Rare",
+    "0": "Depleted (already mined)",
+    "1": "Common (1 point)",
+    "2": "Uncommon (5 points)",
+    "3": "Rare (10 points)",
     "X": "Starting Position"
   }
 }
 
 Notes:
 - localView is a 3x3 array with player at center [1][1]
-- null values indicate out-of-bounds areas
 - "player": true marks the player's current position
+- coordinates show the actual map coordinates for each tile
 
-3. POST /move/:address
-----------------------
-Move a player in a specified direction.
+6. POST /move
+-------------
+Move the authenticated player in a specified direction.
 
-Parameters:
-- address: Ethereum wallet address (in URL path)
+Headers:
+Authorization: Bearer <jwt_token>
 
 Request Body:
 {
   "direction": "north|south|east|west|northeast|northwest|southeast|southwest"
 }
 
-Example: POST /move/0x05937Df8ca0636505d92Fd769d303A3D461587ed
+Example: POST /move
 Body: {"direction": "west"}
 
 Response:
@@ -107,32 +179,91 @@ Response:
   "tile": 2,
   "localView": [
     [
-      {"tile": 1, "player": false},
-      {"tile": 1, "player": false},
-      {"tile": 1, "player": false}
+      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 2}}
     ],
     [
-      {"tile": 1, "player": false},
-      {"tile": 2, "player": true},
-      {"tile": 1, "player": false}
+      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 3}},
+      {"tile": 2, "player": true, "coordinates": {"x": 17, "y": 3}},
+      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 3}}
     ],
     [
-      {"tile": 1, "player": false},
-      {"tile": 1, "player": false},
-      {"tile": 1, "player": false}
+      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 4}}
     ]
   ],
+  "score": 15,
+  "movesRemaining": 7,
+  "minesRemaining": 1,
   "validDirections": ["north", "south", "east", "west", "northeast", "northwest", "southeast", "southwest"]
 }
 
-Error Response (if move invalid):
+Error Response (no moves remaining):
 {
-  "error": "Cannot move outside map bounds"
+  "error": "No moves remaining"
+}
+
+Error Response (invalid direction):
+{
+  "error": "Invalid direction"
+}
+
+7. POST /mine
+-------------
+Mine at the authenticated player's current position to earn points.
+
+Headers:
+Authorization: Bearer <jwt_token>
+
+Request Body: (empty - no parameters needed)
+{}
+
+Example: POST /mine
+
+Response:
+{
+  "success": true,
+  "player": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
+  "position": {"x": 17, "y": 3},
+  "tile": 2,
+  "pointsEarned": 5,
+  "totalScore": 20,
+  "movesRemaining": 7,
+  "minesRemaining": 0,
+  "localView": [
+    [
+      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 2}}
+    ],
+    [
+      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 3}},
+      {"tile": 2, "player": true, "coordinates": {"x": 17, "y": 3}},
+      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 3}}
+    ],
+    [
+      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 4}}
+    ]
+  ]
+}
+
+Error Response (no mines remaining):
+{
+  "error": "No mines remaining"
+}
+
+Error Response (tile already mined):
+{
+  "error": "Tile already mined"
 }
 
 4. GET /players
 ---------------
-Get all player positions and current tiles.
+Get all player positions, current tiles, and game stats.
 
 Response:
 {
@@ -141,12 +272,18 @@ Response:
     {
       "address": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
       "position": {"x": 18, "y": 3},
-      "tile": 2
+      "tile": 2,
+      "score": 15,
+      "movesRemaining": 8,
+      "minesRemaining": 1
     },
     {
       "address": "0x1a39C55e6333025A3Be3768873C846632ACDb6f5", 
       "position": {"x": 5, "y": 10},
-      "tile": 1
+      "tile": 1,
+      "score": 3,
+      "movesRemaining": 12,
+      "minesRemaining": 3
     }
   ],
   "count": 2
@@ -154,26 +291,58 @@ Response:
 
 GAME MECHANICS
 ==============
-- Map is 20x20 grid (coordinates 0-19)
+- Map is 20x20 grid (coordinates 0-19) with wrapping (edges connect)
 - Players start at deterministic positions based on their address + reveal seed
-- Players can move one square at a time in 8 directions
-- Movement is blocked at map boundaries
+- Players can move one square at a time in 8 directions (12 moves max)
+- Players can mine their current tile for points (3 mines max)
+- After mining, tiles become depleted (value 0) and cannot be mined again
 - No collision detection between players
-- No authentication required - just pass address as URL parameter
+- Game ends when player exhausts moves and mines
 
 ERROR HANDLING
 ==============
+Movement Errors:
+- No moves remaining: {"error": "No moves remaining"}
 - Invalid direction: {"error": "Invalid direction"}
 - Player not found: {"error": "Player not found"} (404 status)
-- Out of bounds move: {"error": "Cannot move outside map bounds"}
-- Missing parameters: {"error": "Player address required"} or {"error": "Direction required"}
+
+Mining Errors:
+- No mines remaining: {"error": "No mines remaining"}
+- Tile already mined: {"error": "Tile already mined"}
+- Player not found: {"error": "Player not found"} (404 status)
+
+Authentication Errors:
+- Missing token: {"error": "Access token required"} (401 status)
+- Invalid token: {"error": "Invalid or expired token"} (403 status)
+- Player not registered: {"error": "Player no longer registered"} (403 status)
 
 SAMPLE CLIENT FLOW
 ==================
 1. GET /status - Check if game is loaded
-2. GET /map/:address - Get initial position and local view
-3. POST /move/:address - Make moves based on strategy
-4. Repeat step 3 to explore the map
-5. GET /players - Check other players' positions (optional)
+2. GET /register - Get the message to sign
+3. Sign the message with your Ethereum wallet (e.g., MetaMask)
+4. POST /register - Submit signature to get JWT token
+5. GET /map - Get initial position and local view (with Authorization header)
+6. POST /move - Make strategic moves based on what you see (max 12)
+7. POST /mine - Mine valuable tiles for points (max 3 times)
+8. Repeat steps 6-7 until moves/mines exhausted
+9. GET /players - Check final scores and rankings
+
+STRATEGY TIPS
+=============
+- Scout with moves to find rare tiles (worth 10 points each)
+- Save mines for the most valuable tiles you can find
+- Balance exploration vs mining - you only get 12 moves and 3 mines
+- Common tiles (1 point) may not be worth mining unless you're sure
+- Avoid mining tiles that are already depleted (value 0) - they give no points
+- Coordinate with other players to avoid mining the same valuable tiles
+
+AUTHENTICATION HEADERS
+======================
+For protected endpoints, include the Authorization header:
+Authorization: Bearer <your_jwt_token>
+
+Example with curl:
+curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." http://localhost:8000/map
 
 All responses include "success": true on successful operations. 
