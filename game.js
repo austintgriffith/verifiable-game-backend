@@ -1,5 +1,6 @@
 import express from "express";
 import fs from "fs";
+import https from "https";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { createPublicClientForChain } from "./clients.js";
@@ -73,6 +74,16 @@ let revealSeed = null;
 // Game constants
 const MAX_MOVES = 12;
 const MAX_MINES = 3;
+
+// SSL Detection
+function checkSSLCredentials() {
+  try {
+    return fs.existsSync("server.key") && fs.existsSync("server.cert");
+  } catch (error) {
+    console.log("🔍 SSL credential check failed:", error.message);
+    return false;
+  }
+}
 
 // Scoring system based on land types
 const TILE_POINTS = {
@@ -378,6 +389,23 @@ function minePlayer(playerAddress) {
 
 // API Routes
 
+// GET / - Welcome message
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "Welcome to the Verifiable Game Backend!",
+    version: "1.0.0",
+    endpoints: {
+      register: "/register",
+      map: "/map (requires auth)",
+      move: "/move (requires auth)",
+      mine: "/mine (requires auth)",
+      status: "/status",
+      players: "/players"
+    }
+  });
+});
+
 // GET /register - Get message to sign for authentication
 app.get("/register", (req, res) => {
   const timestamp = Date.now();
@@ -659,10 +687,14 @@ async function initializeGame() {
     process.exit(1);
   }
 
-  const PORT = 8000;
+  // Check for SSL credentials and configure server accordingly
+  const hasSSL = checkSSLCredentials();
+  const PORT = 8000; // Always use port 8000
+  const PROTOCOL = hasSSL ? 'https' : 'http';
 
-  app.listen(PORT, () => {
-    console.log(`\n🚀 Game API Server running on port ${PORT}`);
+  const serverCallback = () => {
+    console.log(`\n🚀 Game API Server running on ${PROTOCOL}://localhost:${PORT}`);
+    console.log(`🔒 SSL: ${hasSSL ? 'ENABLED (server.key & server.cert found)' : 'DISABLED (no SSL credentials found)'}`);
     console.log(`📊 Map size: ${gameMap.size}x${gameMap.size}`);
     console.log(`👥 Players loaded: ${players.length}`);
     console.log(`🔑 Reveal seed: ${revealSeed.substring(0, 10)}...`);
@@ -679,26 +711,49 @@ async function initializeGame() {
     console.log("\n📡 API Endpoints:");
     console.log("Authentication:");
     console.log(
-      `GET  http://localhost:${PORT}/register         - Get message to sign`
+      `GET  ${PROTOCOL}://localhost:${PORT}/register         - Get message to sign`
     );
     console.log(
-      `POST http://localhost:${PORT}/register         - Submit signature for JWT`
+      `POST ${PROTOCOL}://localhost:${PORT}/register         - Submit signature for JWT`
     );
     console.log("\nProtected (require JWT token):");
     console.log(
-      `GET  http://localhost:${PORT}/map              - Get 3x3 local view + stats`
+      `GET  ${PROTOCOL}://localhost:${PORT}/map              - Get 3x3 local view + stats`
     );
-    console.log(`POST http://localhost:${PORT}/move             - Move player`);
+    console.log(`POST ${PROTOCOL}://localhost:${PORT}/move             - Move player`);
     console.log(
-      `POST http://localhost:${PORT}/mine             - Mine for points`
+      `POST ${PROTOCOL}://localhost:${PORT}/mine             - Mine for points`
     );
     console.log("\nPublic:");
-    console.log(`GET  http://localhost:${PORT}/status           - Game status`);
+    console.log(`GET  ${PROTOCOL}://localhost:${PORT}/status           - Game status`);
     console.log(
-      `GET  http://localhost:${PORT}/players          - All player positions + stats`
+      `GET  ${PROTOCOL}://localhost:${PORT}/players          - All player positions + stats`
     );
     console.log("\n✅ Server ready!");
-  });
+  };
+
+  if (hasSSL) {
+    // Create HTTPS server
+    try {
+      const httpsOptions = {
+        key: fs.readFileSync("server.key"),
+        cert: fs.readFileSync("server.cert"),
+      };
+      
+      https.createServer(httpsOptions, app).listen(PORT, '0.0.0.0', serverCallback);
+    } catch (error) {
+      console.error("❌ Failed to start HTTPS server:", error.message);
+      console.log("🔄 Falling back to HTTP server...");
+             app.listen(8000, '0.0.0.0', () => {
+         console.log(`\n🚀 Game API Server running on http://localhost:8000 (SSL fallback)`);
+         console.log(`🔒 SSL: FAILED (could not read SSL credentials)`);
+         serverCallback();
+       });
+    }
+  } else {
+    // Create HTTP server
+    app.listen(PORT, '0.0.0.0', serverCallback);
+  }
 }
 
 // Start the server
