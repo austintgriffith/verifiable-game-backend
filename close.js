@@ -1,5 +1,6 @@
 import { createClients } from "./clients.js";
 import dotenv from "dotenv";
+import fs from "fs";
 
 // Load environment variables
 dotenv.config();
@@ -7,28 +8,26 @@ dotenv.config();
 // Contract ABI for the game management functions
 const GAME_MANAGEMENT_ABI = [
   {
-    inputs: [],
+    inputs: [{ name: "gameId", type: "uint256" }],
     name: "closeGame",
     outputs: [],
     stateMutability: "nonpayable",
     type: "function",
   },
   {
-    inputs: [],
-    name: "open",
-    outputs: [{ name: "", type: "bool" }],
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getGameInfo",
+    outputs: [
+      { name: "gamemaster", type: "address" },
+      { name: "stakeAmount", type: "uint256" },
+      { name: "open", type: "bool" },
+      { name: "playerCount", type: "uint256" },
+    ],
     stateMutability: "view",
     type: "function",
   },
   {
-    inputs: [],
-    name: "getPlayerCount",
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [],
+    inputs: [{ name: "gameId", type: "uint256" }],
     name: "getPlayers",
     outputs: [{ name: "", type: "address[]" }],
     stateMutability: "view",
@@ -36,10 +35,26 @@ const GAME_MANAGEMENT_ABI = [
   },
 ];
 
+// Note: Score saving is now handled by the game server when it's closed with Ctrl+C
+
 async function main() {
   try {
     console.log("\n🎮 Game Management: CLOSE Game");
     console.log("===============================");
+
+    // Parse command line arguments
+    const args = process.argv.slice(2);
+    const gameIdArg = args.find((arg) => arg.startsWith("--gameId="));
+    const gameId = gameIdArg ? gameIdArg.split("=")[1] : args[0];
+
+    if (!gameId) {
+      console.error("❌ Game ID is required");
+      console.log("Usage: node close.js <gameId>");
+      console.log("   or: node close.js --gameId=<gameId>");
+      process.exit(1);
+    }
+
+    console.log(`🎮 Game ID: ${gameId}`);
 
     // Get contract address from environment
     const contractAddress = process.env.CONTRACT_ADDRESS;
@@ -55,24 +70,25 @@ async function main() {
 
     // Check current game state
     console.log("\n📊 Checking current game state...");
-    const isGameOpen = await publicClient.readContract({
+    const gameInfo = await publicClient.readContract({
       address: contractAddress,
       abi: GAME_MANAGEMENT_ABI,
-      functionName: "open",
+      functionName: "getGameInfo",
+      args: [BigInt(gameId)],
     });
 
-    const playerCount = await publicClient.readContract({
-      address: contractAddress,
-      abi: GAME_MANAGEMENT_ABI,
-      functionName: "getPlayerCount",
-    });
+    const [gamemaster, stakeAmount, isGameOpen, playerCount] = gameInfo;
 
     console.log(`Game Status: ${isGameOpen ? "OPEN" : "CLOSED"}`);
+    console.log(`Gamemaster: ${gamemaster}`);
+    console.log(`Stake Amount: ${Number(stakeAmount) / 1e18} ETH`);
     console.log(`Current Players: ${playerCount.toString()}`);
 
     if (!isGameOpen) {
       console.log("⚠️  Game is already closed!");
-      console.log("💡 Run 'node open.js' to open the game for players");
+      console.log(
+        `💡 Run 'node open.js ${gameId}' to open the game for players`
+      );
       process.exit(0);
     }
 
@@ -83,12 +99,16 @@ async function main() {
         address: contractAddress,
         abi: GAME_MANAGEMENT_ABI,
         functionName: "getPlayers",
+        args: [BigInt(gameId)],
       });
       players.forEach((player, index) => {
         console.log(`${index + 1}. ${player}`);
       });
       console.log(
-        `\n💰 Total ETH staked: ${(Number(playerCount) * 0.001).toFixed(3)} ETH`
+        `\n💰 Total ETH staked: ${(
+          (Number(playerCount) * Number(stakeAmount)) /
+          1e18
+        ).toFixed(6)} ETH`
       );
     } else {
       console.log("\n👥 No players have joined yet");
@@ -100,6 +120,7 @@ async function main() {
       address: contractAddress,
       abi: GAME_MANAGEMENT_ABI,
       functionName: "closeGame",
+      args: [BigInt(gameId)],
     });
 
     console.log(`Close game transaction: ${closeTxHash}`);
@@ -115,30 +136,37 @@ async function main() {
       console.log(`Gas used: ${receipt.gasUsed.toString()}`);
 
       // Verify the new state
-      const newGameState = await publicClient.readContract({
+      const newGameInfo = await publicClient.readContract({
         address: contractAddress,
         abi: GAME_MANAGEMENT_ABI,
-        functionName: "open",
+        functionName: "getGameInfo",
+        args: [BigInt(gameId)],
       });
 
-      const finalPlayerCount = await publicClient.readContract({
-        address: contractAddress,
-        abi: GAME_MANAGEMENT_ABI,
-        functionName: "getPlayerCount",
-      });
+      const [, , newGameState, finalPlayerCount] = newGameInfo;
 
       console.log(`\n📊 Final game state: ${newGameState ? "OPEN" : "CLOSED"}`);
       console.log(`👥 Final player count: ${finalPlayerCount.toString()}`);
       console.log(
-        `💰 Total ETH collected: ${(Number(finalPlayerCount) * 0.001).toFixed(
-          3
-        )} ETH`
+        `💰 Total ETH collected: ${(
+          (Number(finalPlayerCount) * Number(stakeAmount)) /
+          1e18
+        ).toFixed(6)} ETH`
       );
 
-      console.log(`\n🎯 Game is now closed!`);
+      console.log(`\n🎯 Game ${gameId} is now closed!`);
       console.log(`🚫 No more players can join`);
       console.log(`🎲 You can now proceed with commit-reveal if needed`);
-      console.log(`🔄 Run 'node open.js' to start a new game`);
+      console.log(`🔄 Run 'node open.js ${gameId}' to reopen this game`);
+      console.log(`\n💡 Next steps:`);
+      console.log(`1. Run 'node game.js ${gameId}' to start the game server`);
+      console.log(`2. Players can now play the game`);
+      console.log(
+        `3. Press Ctrl+C to stop the game server and save final scores`
+      );
+      console.log(
+        `4. Run 'node payout.js ${gameId}' to distribute prizes to winners`
+      );
     } else {
       console.log(`❌ Closing game failed`);
       process.exit(1);
@@ -149,6 +177,8 @@ async function main() {
       console.log("💡 Make sure you're using the gamemaster private key");
     } else if (error.message.includes("Game is already closed")) {
       console.log("💡 Game is already closed");
+    } else if (error.message.includes("Game does not exist")) {
+      console.log("💡 Game does not exist. Make sure the game ID is correct");
     }
     process.exit(1);
   }

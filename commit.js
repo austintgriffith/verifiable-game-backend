@@ -9,14 +9,17 @@ dotenv.config();
 // Contract ABI for the commit-reveal functions
 const COMMIT_REVEAL_ABI = [
   {
-    inputs: [{ name: "_hash", type: "bytes32" }],
+    inputs: [
+      { name: "gameId", type: "uint256" },
+      { name: "_hash", type: "bytes32" },
+    ],
     name: "commitHash",
     outputs: [],
     stateMutability: "nonpayable",
     type: "function",
   },
   {
-    inputs: [],
+    inputs: [{ name: "gameId", type: "uint256" }],
     name: "getCommitRevealState",
     outputs: [
       { name: "_committedHash", type: "bytes32" },
@@ -30,8 +33,8 @@ const COMMIT_REVEAL_ABI = [
     type: "function",
   },
   {
-    inputs: [],
-    name: "resetCommitReveal",
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "resetGame",
     outputs: [],
     stateMutability: "nonpayable",
     type: "function",
@@ -49,6 +52,20 @@ async function main() {
   try {
     console.log("\n🎲 Commit-Reveal System: COMMIT Phase");
     console.log("======================================");
+
+    // Parse command line arguments
+    const args = process.argv.slice(2);
+    const gameIdArg = args.find((arg) => arg.startsWith("--gameId="));
+    const gameId = gameIdArg ? gameIdArg.split("=")[1] : args[0];
+
+    if (!gameId) {
+      console.error("❌ Game ID is required");
+      console.log("Usage: node commit.js <gameId> [--reset]");
+      console.log("   or: node commit.js --gameId=<gameId> [--reset]");
+      process.exit(1);
+    }
+
+    console.log(`🎮 Game ID: ${gameId}`);
 
     // Get contract address from environment
     const contractAddress = process.env.CONTRACT_ADDRESS;
@@ -68,6 +85,7 @@ async function main() {
       address: contractAddress,
       abi: COMMIT_REVEAL_ABI,
       functionName: "getCommitRevealState",
+      args: [BigInt(gameId)],
     });
 
     const [
@@ -89,24 +107,26 @@ async function main() {
       console.log(`Committed Hash: ${committedHash}`);
       console.log(`Commit Block Number: ${commitBlockNumber}`);
       console.log("\n🔄 You can either:");
-      console.log("1. Run 'node reveal.js' to reveal the existing commit");
+      console.log(
+        "1. Run 'node reveal.js <gameId>' to reveal the existing commit"
+      );
       console.log("2. Add --reset flag to reset and make a new commit");
 
-      const args = process.argv.slice(2);
       if (!args.includes("--reset")) {
         process.exit(1);
       }
 
-      console.log("\n🔄 Resetting commit-reveal system...");
+      console.log("\n🔄 Resetting game...");
       const resetHash = await walletClient.writeContract({
         address: contractAddress,
         abi: COMMIT_REVEAL_ABI,
-        functionName: "resetCommitReveal",
+        functionName: "resetGame",
+        args: [BigInt(gameId)],
       });
 
       console.log(`Reset transaction: ${resetHash}`);
       await publicClient.waitForTransactionReceipt({ hash: resetHash });
-      console.log("✅ System reset successfully");
+      console.log("✅ Game reset successfully");
     }
 
     // Generate random reveal value
@@ -119,8 +139,8 @@ async function main() {
     console.log(`Commit hash: ${commitHash}`);
 
     // Save reveal value to file for later use
-    console.log("\n💾 Saving reveal value to reveal.txt...");
-    writeFileSync("reveal.txt", revealBytes32);
+    console.log(`\n💾 Saving reveal value to reveal_${gameId}.txt...`);
+    writeFileSync(`reveal_${gameId}.txt`, revealBytes32);
     console.log("✅ Reveal value saved successfully");
 
     // Commit the hash to the contract
@@ -129,7 +149,7 @@ async function main() {
       address: contractAddress,
       abi: COMMIT_REVEAL_ABI,
       functionName: "commitHash",
-      args: [commitHash],
+      args: [BigInt(gameId), commitHash],
     });
 
     console.log(`Commit transaction: ${commitTxHash}`);
@@ -149,6 +169,7 @@ async function main() {
         address: contractAddress,
         abi: COMMIT_REVEAL_ABI,
         functionName: "getCommitRevealState",
+        args: [BigInt(gameId)],
       });
 
       const [newCommittedHash, newCommitBlockNumber] = newState;
@@ -160,8 +181,10 @@ async function main() {
       console.log(
         `1. Wait for at least block ${newCommitBlockNumber} (current: ${await publicClient.getBlockNumber()})`
       );
-      console.log(`2. Run 'node reveal.js' to reveal and generate randomness`);
-      console.log(`3. The reveal value is saved in reveal.txt`);
+      console.log(
+        `2. Run 'node reveal.js ${gameId}' to reveal and generate randomness`
+      );
+      console.log(`3. The reveal value is saved in reveal_${gameId}.txt`);
     } else {
       console.log(`❌ Commit failed`);
       process.exit(1);

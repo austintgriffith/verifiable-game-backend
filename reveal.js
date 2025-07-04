@@ -8,14 +8,17 @@ dotenv.config();
 // Contract ABI for the commit-reveal functions
 const COMMIT_REVEAL_ABI = [
   {
-    inputs: [{ name: "_reveal", type: "bytes32" }],
+    inputs: [
+      { name: "gameId", type: "uint256" },
+      { name: "_reveal", type: "bytes32" },
+    ],
     name: "revealHash",
     outputs: [],
     stateMutability: "nonpayable",
     type: "function",
   },
   {
-    inputs: [],
+    inputs: [{ name: "gameId", type: "uint256" }],
     name: "getCommitRevealState",
     outputs: [
       { name: "_committedHash", type: "bytes32" },
@@ -31,15 +34,15 @@ const COMMIT_REVEAL_ABI = [
 ];
 
 // Read reveal value from file
-function readRevealValue() {
+function readRevealValue(gameId) {
   try {
-    const revealValue = readFileSync("reveal.txt", "utf8").trim();
+    const revealValue = readFileSync(`reveal_${gameId}.txt`, "utf8").trim();
     if (!revealValue) {
       throw new Error("Reveal file is empty");
     }
     return revealValue;
   } catch (error) {
-    throw new Error(`Failed to read reveal.txt: ${error.message}`);
+    throw new Error(`Failed to read reveal_${gameId}.txt: ${error.message}`);
   }
 }
 
@@ -47,6 +50,20 @@ async function main() {
   try {
     console.log("\n🔮 Commit-Reveal System: REVEAL Phase");
     console.log("======================================");
+
+    // Parse command line arguments
+    const args = process.argv.slice(2);
+    const gameIdArg = args.find((arg) => arg.startsWith("--gameId="));
+    const gameId = gameIdArg ? gameIdArg.split("=")[1] : args[0];
+
+    if (!gameId) {
+      console.error("❌ Game ID is required");
+      console.log("Usage: node reveal.js <gameId>");
+      console.log("   or: node reveal.js --gameId=<gameId>");
+      process.exit(1);
+    }
+
+    console.log(`🎮 Game ID: ${gameId}`);
 
     // Get contract address from environment
     const contractAddress = process.env.CONTRACT_ADDRESS;
@@ -66,6 +83,7 @@ async function main() {
       address: contractAddress,
       abi: COMMIT_REVEAL_ABI,
       functionName: "getCommitRevealState",
+      args: [BigInt(gameId)],
     });
 
     const [
@@ -83,7 +101,7 @@ async function main() {
 
     if (!hasCommitted) {
       console.log("❌ No hash has been committed yet!");
-      console.log("💡 Run 'node commit.js' first to commit a hash");
+      console.log(`💡 Run 'node commit.js ${gameId}' first to commit a hash`);
       process.exit(1);
     }
 
@@ -92,7 +110,7 @@ async function main() {
       console.log(`Previous Reveal Value: ${revealValue}`);
       console.log(`Generated Random Hash: ${randomHash}`);
       console.log(
-        "💡 Run 'node commit.js --reset' to start a new commit-reveal cycle"
+        `💡 Run 'node commit.js ${gameId} --reset' to start a new commit-reveal cycle`
       );
       process.exit(1);
     }
@@ -112,8 +130,8 @@ async function main() {
     }
 
     // Read reveal value from file
-    console.log("\n📖 Reading reveal value from reveal.txt...");
-    const storedRevealValue = readRevealValue();
+    console.log(`\n📖 Reading reveal value from reveal_${gameId}.txt...`);
+    const storedRevealValue = readRevealValue(gameId);
     console.log(`Reveal value: ${storedRevealValue}`);
 
     // Reveal the hash
@@ -122,7 +140,7 @@ async function main() {
       address: contractAddress,
       abi: COMMIT_REVEAL_ABI,
       functionName: "revealHash",
-      args: [storedRevealValue],
+      args: [BigInt(gameId), storedRevealValue],
     });
 
     console.log(`Reveal transaction: ${revealTxHash}`);
@@ -142,17 +160,18 @@ async function main() {
         address: contractAddress,
         abi: COMMIT_REVEAL_ABI,
         functionName: "getCommitRevealState",
+        args: [BigInt(gameId)],
       });
 
       const [, , finalRevealValue, finalRandomHash] = finalState;
       console.log(`\n🎉 Random hash generated successfully!`);
-      console.log(`📊 Final state:`);
+      console.log(`📊 Final state for game ${gameId}:`);
       console.log(`Reveal Value: ${finalRevealValue}`);
       console.log(`🎲 Generated Random Hash: ${finalRandomHash}`);
 
-      console.log(`\n🎯 Commit-reveal cycle complete!`);
+      console.log(`\n🎯 Commit-reveal cycle complete for game ${gameId}!`);
       console.log(`💡 You can now use the random hash: ${finalRandomHash}`);
-      console.log(`🔄 Run 'node commit.js' to start a new cycle`);
+      console.log(`🔄 Run 'node commit.js ${gameId}' to start a new cycle`);
     } else {
       console.log(`❌ Reveal failed`);
       process.exit(1);
@@ -162,17 +181,23 @@ async function main() {
     if (error.message.includes("Not authorized")) {
       console.log("💡 Make sure you're using the gamemaster private key");
     } else if (error.message.includes("No hash has been committed")) {
-      console.log("💡 Run 'node commit.js' first to commit a hash");
+      console.log("💡 Run 'node commit.js <gameId>' first to commit a hash");
     } else if (error.message.includes("Hash has already been revealed")) {
-      console.log("💡 Run 'node commit.js --reset' to start a new cycle");
+      console.log(
+        "💡 Run 'node commit.js <gameId> --reset' to start a new cycle"
+      );
     } else if (error.message.includes("Cannot reveal before")) {
       console.log("💡 Wait for the required block number before revealing");
     } else if (error.message.includes("Reveal does not match")) {
       console.log("💡 The reveal value doesn't match the committed hash");
     } else if (error.message.includes("Blockhash not available")) {
       console.log("💡 The blockhash is too old (more than 256 blocks)");
-    } else if (error.message.includes("Failed to read reveal.txt")) {
-      console.log("💡 Make sure reveal.txt exists (run commit.js first)");
+    } else if (error.message.includes("Failed to read reveal_")) {
+      console.log(
+        "💡 Make sure reveal_<gameId>.txt exists (run commit.js first)"
+      );
+    } else if (error.message.includes("Game does not exist")) {
+      console.log("💡 Game does not exist. Make sure the game ID is correct");
     }
     process.exit(1);
   }

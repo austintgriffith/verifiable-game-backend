@@ -7,28 +7,26 @@ dotenv.config();
 // Contract ABI for the game management functions
 const GAME_MANAGEMENT_ABI = [
   {
-    inputs: [],
+    inputs: [{ name: "gameId", type: "uint256" }],
     name: "openGame",
     outputs: [],
     stateMutability: "nonpayable",
     type: "function",
   },
   {
-    inputs: [],
-    name: "open",
-    outputs: [{ name: "", type: "bool" }],
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getGameInfo",
+    outputs: [
+      { name: "gamemaster", type: "address" },
+      { name: "stakeAmount", type: "uint256" },
+      { name: "open", type: "bool" },
+      { name: "playerCount", type: "uint256" },
+    ],
     stateMutability: "view",
     type: "function",
   },
   {
-    inputs: [],
-    name: "getPlayerCount",
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [],
+    inputs: [{ name: "gameId", type: "uint256" }],
     name: "getPlayers",
     outputs: [{ name: "", type: "address[]" }],
     stateMutability: "view",
@@ -40,6 +38,20 @@ async function main() {
   try {
     console.log("\n🎮 Game Management: OPEN Game");
     console.log("==============================");
+
+    // Parse command line arguments
+    const args = process.argv.slice(2);
+    const gameIdArg = args.find((arg) => arg.startsWith("--gameId="));
+    const gameId = gameIdArg ? gameIdArg.split("=")[1] : args[0];
+
+    if (!gameId) {
+      console.error("❌ Game ID is required");
+      console.log("Usage: node open.js <gameId>");
+      console.log("   or: node open.js --gameId=<gameId>");
+      process.exit(1);
+    }
+
+    console.log(`🎮 Game ID: ${gameId}`);
 
     // Get contract address from environment
     const contractAddress = process.env.CONTRACT_ADDRESS;
@@ -55,31 +67,35 @@ async function main() {
 
     // Check current game state
     console.log("\n📊 Checking current game state...");
-    const isGameOpen = await publicClient.readContract({
+    const gameInfo = await publicClient.readContract({
       address: contractAddress,
       abi: GAME_MANAGEMENT_ABI,
-      functionName: "open",
+      functionName: "getGameInfo",
+      args: [BigInt(gameId)],
     });
 
-    const playerCount = await publicClient.readContract({
-      address: contractAddress,
-      abi: GAME_MANAGEMENT_ABI,
-      functionName: "getPlayerCount",
-    });
+    const [gamemaster, stakeAmount, isGameOpen, playerCount] = gameInfo;
 
     console.log(`Game Status: ${isGameOpen ? "OPEN" : "CLOSED"}`);
+    console.log(`Gamemaster: ${gamemaster}`);
+    console.log(`Stake Amount: ${Number(stakeAmount) / 1e18} ETH`);
     console.log(`Current Players: ${playerCount.toString()}`);
 
     if (isGameOpen) {
       console.log("⚠️  Game is already open!");
-      console.log("💡 Players can join by calling joinGame() with 0.001 ETH");
-      console.log("💡 Run 'node close.js' to close the game");
+      console.log(
+        `💡 Players can join by calling joinGame(${gameId}) with ${
+          Number(stakeAmount) / 1e18
+        } ETH`
+      );
+      console.log(`💡 Run 'node close.js ${gameId}' to close the game`);
 
       if (playerCount > 0) {
         const players = await publicClient.readContract({
           address: contractAddress,
           abi: GAME_MANAGEMENT_ABI,
           functionName: "getPlayers",
+          args: [BigInt(gameId)],
         });
         console.log("\n👥 Current players:");
         players.forEach((player, index) => {
@@ -96,6 +112,7 @@ async function main() {
       address: contractAddress,
       abi: GAME_MANAGEMENT_ABI,
       functionName: "openGame",
+      args: [BigInt(gameId)],
     });
 
     console.log(`Open game transaction: ${openTxHash}`);
@@ -111,17 +128,25 @@ async function main() {
       console.log(`Gas used: ${receipt.gasUsed.toString()}`);
 
       // Verify the new state
-      const newGameState = await publicClient.readContract({
+      const newGameInfo = await publicClient.readContract({
         address: contractAddress,
         abi: GAME_MANAGEMENT_ABI,
-        functionName: "open",
+        functionName: "getGameInfo",
+        args: [BigInt(gameId)],
       });
 
+      const [, , newGameState] = newGameInfo;
       console.log(`\n📊 New game state: ${newGameState ? "OPEN" : "CLOSED"}`);
-      console.log(`\n🎯 Game is now open for players to join!`);
-      console.log(`💰 Players must stake exactly 0.001 ETH to join`);
-      console.log(`🎮 Players can call joinGame() to participate`);
-      console.log(`🔒 Run 'node close.js' when ready to close the game`);
+      console.log(`\n🎯 Game ${gameId} is now open for players to join!`);
+      console.log(
+        `💰 Players must stake exactly ${
+          Number(stakeAmount) / 1e18
+        } ETH to join`
+      );
+      console.log(`🎮 Players can call joinGame(${gameId}) to participate`);
+      console.log(
+        `🔒 Run 'node close.js ${gameId}' when ready to close the game`
+      );
     } else {
       console.log(`❌ Opening game failed`);
       process.exit(1);
@@ -132,6 +157,8 @@ async function main() {
       console.log("💡 Make sure you're using the gamemaster private key");
     } else if (error.message.includes("Game is already open")) {
       console.log("💡 Game is already open for players to join");
+    } else if (error.message.includes("Game does not exist")) {
+      console.log("💡 Game does not exist. Make sure the game ID is correct");
     }
     process.exit(1);
   }

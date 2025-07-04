@@ -1,5 +1,6 @@
 import { createClients } from "./clients.js";
 import dotenv from "dotenv";
+import fs from "fs";
 
 // Load environment variables
 dotenv.config();
@@ -7,30 +8,40 @@ dotenv.config();
 // Contract ABI for the payout function
 const PAYOUT_ABI = [
   {
-    inputs: [{ name: "_winners", type: "address[]" }],
+    inputs: [
+      { name: "gameId", type: "uint256" },
+      { name: "_winners", type: "address[]" },
+    ],
     name: "payout",
     outputs: [],
     stateMutability: "nonpayable",
     type: "function",
   },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getGameInfo",
+    outputs: [
+      { name: "gamemaster", type: "address" },
+      { name: "stakeAmount", type: "uint256" },
+      { name: "open", type: "bool" },
+      { name: "playerCount", type: "uint256" },
+    ],
+    stateMutability: "view",
+    type: "function",
+  },
 ];
 
-// Function to fetch player scores from game server
-async function fetchPlayerScores() {
+// Function to read player scores from saved file
+function readPlayerScores(gameId) {
   try {
-    const response = await fetch("http://localhost:8000/players");
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    const data = await response.json();
-
-    if (!data.success) {
-      throw new Error("Failed to fetch player data from game server");
-    }
-
-    return data.players;
+    console.log(`📊 Reading final player scores from scores_${gameId}.txt...`);
+    const scoresData = JSON.parse(
+      fs.readFileSync(`scores_${gameId}.txt`, "utf8")
+    );
+    console.log(`✅ Loaded scores (saved at ${scoresData.savedAt})`);
+    return scoresData.players;
   } catch (error) {
-    throw new Error(`Failed to fetch player scores: ${error.message}`);
+    throw new Error(`Failed to read scores_${gameId}.txt: ${error.message}`);
   }
 }
 
@@ -52,9 +63,22 @@ function findWinners(players) {
 }
 
 async function main() {
+  // Parse command line arguments (moved outside try block for scope)
+  const args = process.argv.slice(2);
+  const gameIdArg = args.find((arg) => arg.startsWith("--gameId="));
+  const gameId = gameIdArg ? gameIdArg.split("=")[1] : args[0];
+
+  if (!gameId) {
+    console.error("❌ Game ID is required");
+    console.log("Usage: node payout.js <gameId>");
+    console.log("   or: node payout.js --gameId=<gameId>");
+    process.exit(1);
+  }
+
   try {
     console.log("\n💰 Game Payout: Paying Winners");
     console.log("==============================");
+    console.log(`🎮 Game ID: ${gameId}`);
 
     // Get contract address from environment
     const contractAddress = process.env.CONTRACT_ADDRESS;
@@ -68,9 +92,27 @@ async function main() {
     console.log(`Gamemaster Account: ${account.address}`);
     console.log(`Contract: ${contractAddress}`);
 
-    // Fetch player scores from game server
-    console.log("\n📊 Fetching player scores from game server...");
-    const players = await fetchPlayerScores();
+    // Get game info to calculate prize pool
+    console.log("\n📊 Fetching game information...");
+    const gameInfo = await publicClient.readContract({
+      address: contractAddress,
+      abi: PAYOUT_ABI,
+      functionName: "getGameInfo",
+      args: [BigInt(gameId)],
+    });
+
+    const [gamemaster, stakeAmount, open, playerCount] = gameInfo;
+    console.log(`Gamemaster: ${gamemaster}`);
+    console.log(`Stake Amount: ${Number(stakeAmount) / 1e18} ETH`);
+    console.log(`Game Status: ${open ? "OPEN" : "CLOSED"}`);
+    console.log(`Player Count: ${playerCount.toString()}`);
+
+    // Calculate total prize pool for this game
+    const gamePrizePool = BigInt(stakeAmount) * BigInt(playerCount);
+    console.log(`🏆 Game Prize Pool: ${Number(gamePrizePool) / 1e18} ETH`);
+
+    // Read final player scores from file
+    const players = readPlayerScores(gameId);
 
     if (players.length === 0) {
       console.log("❌ No players found in the game");
@@ -117,26 +159,33 @@ async function main() {
     const contractBalanceEth = Number(contractBalance) / 1e18;
     console.log(`\n💸 Contract Balance: ${contractBalanceEth.toFixed(6)} ETH`);
 
-    if (contractBalance === 0n) {
-      console.log("❌ No funds available for payout");
+    if (contractBalance < gamePrizePool) {
+      console.log(
+        "❌ Contract doesn't have enough funds for this game's payout"
+      );
+      console.log(
+        `💡 Required: ${
+          Number(gamePrizePool) / 1e18
+        } ETH, Available: ${contractBalanceEth} ETH`
+      );
       process.exit(1);
     }
 
-    const amountPerWinner = contractBalance / BigInt(winners.length);
+    const amountPerWinner = gamePrizePool / BigInt(winners.length);
     const amountPerWinnerEth = Number(amountPerWinner) / 1e18;
 
     console.log(`💰 Payout per winner: ${amountPerWinnerEth.toFixed(6)} ETH`);
 
     // Call payout function
     console.log(
-      `\n🚀 Calling payout function with ${winners.length} winner(s)...`
+      `\n🚀 Calling payout function for game ${gameId} with ${winners.length} winner(s)...`
     );
 
     const payoutTxHash = await walletClient.writeContract({
       address: contractAddress,
       abi: PAYOUT_ABI,
       functionName: "payout",
-      args: [winners],
+      args: [BigInt(gameId), winners],
     });
 
     console.log(`Payout transaction: ${payoutTxHash}`);
@@ -159,8 +208,10 @@ async function main() {
       const newBalanceEth = Number(newBalance) / 1e18;
       console.log(`\n💰 New contract balance: ${newBalanceEth.toFixed(6)} ETH`);
 
-      console.log(`\n🎉 Successfully paid out ${winners.length} winner(s)!`);
-      console.log(`💸 Total distributed: ${contractBalanceEth.toFixed(6)} ETH`);
+      console.log(
+        `\n🎉 Successfully paid out ${winners.length} winner(s) for game ${gameId}!`
+      );
+      console.log(`💸 Total distributed: ${Number(gamePrizePool) / 1e18} ETH`);
       console.log(`🎯 Amount per winner: ${amountPerWinnerEth.toFixed(6)} ETH`);
     } else {
       console.log(`❌ Payout transaction failed`);
@@ -171,13 +222,15 @@ async function main() {
 
     if (error.message.includes("Not authorized")) {
       console.log("💡 Make sure you're using the gamemaster private key");
-    } else if (error.message.includes("No funds available")) {
-      console.log("💡 Contract has no ETH balance to distribute");
-    } else if (error.message.includes("fetch")) {
+    } else if (error.message.includes("No players in the game")) {
+      console.log("💡 No players have joined this game yet");
+    } else if (error.message.includes("Failed to read scores_")) {
+      console.log(`💡 Could not find scores_${gameId}.txt`);
       console.log(
-        "💡 Make sure the game server is running on http://localhost:8000"
+        `💡 Make sure you ran 'node game.js ${gameId}' and closed it with Ctrl+C after players finished the game`
       );
-      console.log("💡 Run 'node game.js' to start the game server");
+    } else if (error.message.includes("Game does not exist")) {
+      console.log("💡 Game does not exist. Make sure the game ID is correct");
     }
 
     process.exit(1);

@@ -17,6 +17,9 @@ const BASE_JWT_SECRET =
   process.env.JWT_SECRET || "your-secret-key-change-this-in-production";
 const JWT_EXPIRES_IN = "1h";
 
+// Game ID - parsed from command line arguments
+let GAME_ID = null;
+
 // Make JWT secret contract-specific by including contract address
 function getJWTSecret() {
   const contractAddress = process.env.CONTRACT_ADDRESS;
@@ -49,16 +52,28 @@ app.use(express.json());
 // Contract ABI for reading players
 const GAME_MANAGEMENT_ABI = [
   {
-    inputs: [],
+    inputs: [{ name: "gameId", type: "uint256" }],
     name: "getPlayers",
     outputs: [{ name: "", type: "address[]" }],
     stateMutability: "view",
     type: "function",
   },
   {
-    inputs: [],
+    inputs: [{ name: "gameId", type: "uint256" }],
     name: "getPlayerCount",
     outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getGameInfo",
+    outputs: [
+      { name: "gamemaster", type: "address" },
+      { name: "stakeAmount", type: "uint256" },
+      { name: "open", type: "bool" },
+      { name: "playerCount", type: "uint256" },
+    ],
     stateMutability: "view",
     type: "function",
   },
@@ -110,10 +125,11 @@ function generateSignMessage(providedTimestamp = null) {
   const contractAddress = process.env.CONTRACT_ADDRESS;
   const timestamp = providedTimestamp || Date.now();
 
-  const message = `Sign this message to authenticate with the game server.\n\nContract: ${contractAddress}\nNamespace: ScriptGame\nTimestamp: ${timestamp}\n\nThis signature is valid for 5 minutes.`;
+  const message = `Sign this message to authenticate with the game server.\n\nContract: ${contractAddress}\nGameId: ${GAME_ID}\nNamespace: ScriptGame\nTimestamp: ${timestamp}\n\nThis signature is valid for 5 minutes.`;
 
   console.log("📝 generateSignMessage() called");
   console.log("   - Contract:", contractAddress);
+  console.log("   - Game ID:", GAME_ID);
   console.log("   - Timestamp:", timestamp);
   console.log("   - Provided timestamp:", providedTimestamp);
   console.log("   - Message length:", message.length);
@@ -167,34 +183,37 @@ function authenticateToken(req, res, next) {
 }
 
 // Load game map from file
-function loadGameMap() {
+function loadGameMap(gameId) {
   try {
-    const mapData = JSON.parse(fs.readFileSync("map.txt", "utf8"));
+    const mapData = JSON.parse(fs.readFileSync(`map_${gameId}.txt`, "utf8"));
     gameMap = mapData;
-    console.log(`✅ Loaded ${mapData.size}x${mapData.size} game map`);
+    console.log(
+      `✅ Loaded ${mapData.size}x${mapData.size} game map for game ${gameId}`
+    );
     return true;
   } catch (error) {
-    console.error("❌ Failed to load map.txt:", error.message);
+    console.error(`❌ Failed to load map_${gameId}.txt:`, error.message);
     return false;
   }
 }
 
 // Load reveal seed from file
-function loadRevealSeed() {
+function loadRevealSeed(gameId) {
   try {
-    revealSeed = fs.readFileSync("reveal.txt", "utf8").trim();
-    console.log(`✅ Loaded reveal seed: ${revealSeed}`);
+    revealSeed = fs.readFileSync(`reveal_${gameId}.txt`, "utf8").trim();
+    console.log(`✅ Loaded reveal seed for game ${gameId}: ${revealSeed}`);
     return true;
   } catch (error) {
-    console.error("❌ Failed to load reveal.txt:", error.message);
+    console.error(`❌ Failed to load reveal_${gameId}.txt:`, error.message);
     return false;
   }
 }
 
 // Generate starting position for a player based on reveal seed + address
 function generateStartingPosition(playerAddress) {
-  // Combine reveal seed with player address
-  const combined = revealSeed + playerAddress.toLowerCase();
+  // Combine reveal seed with player address and game ID
+  const combined =
+    revealSeed + playerAddress.toLowerCase() + GAME_ID.toString();
 
   // Hash the combination
   const hash = crypto.createHash("sha256").update(combined).digest("hex");
@@ -211,7 +230,7 @@ function generateStartingPosition(playerAddress) {
 }
 
 // Read players from smart contract
-async function loadPlayers() {
+async function loadPlayers(gameId) {
   try {
     const contractAddress = process.env.CONTRACT_ADDRESS;
     if (!contractAddress) {
@@ -220,14 +239,17 @@ async function loadPlayers() {
 
     const publicClient = createPublicClientForChain();
 
-    // Get players array from contract
+    // Get players array from contract for specific game
     const contractPlayers = await publicClient.readContract({
       address: contractAddress,
       abi: GAME_MANAGEMENT_ABI,
       functionName: "getPlayers",
+      args: [BigInt(gameId)],
     });
 
-    console.log(`✅ Loaded ${contractPlayers.length} players from contract`);
+    console.log(
+      `✅ Loaded ${contractPlayers.length} players from contract for game ${gameId}`
+    );
 
     // Generate starting positions for each player
     players = contractPlayers;
@@ -395,14 +417,15 @@ app.get("/", (req, res) => {
     success: true,
     message: "Welcome to the Verifiable Game Backend!",
     version: "1.0.0",
+    gameId: GAME_ID,
     endpoints: {
       register: "/register",
       map: "/map (requires auth)",
       move: "/move (requires auth)",
       mine: "/mine (requires auth)",
       status: "/status",
-      players: "/players"
-    }
+      players: "/players",
+    },
   });
 });
 
@@ -414,11 +437,13 @@ app.get("/register", (req, res) => {
   console.log("\n🔐 GET /register - Generating sign message");
   console.log("📝 Message to sign:", message);
   console.log("📍 Contract address:", process.env.CONTRACT_ADDRESS);
+  console.log("🎮 Game ID:", GAME_ID);
 
   res.json({
     success: true,
     message: message,
     timestamp: timestamp,
+    gameId: GAME_ID,
     instructions: "Sign this message with your Ethereum wallet to authenticate",
   });
 });
@@ -629,6 +654,7 @@ app.post("/mine", authenticateToken, (req, res) => {
 app.get("/status", (req, res) => {
   res.json({
     success: true,
+    gameId: GAME_ID,
     gameLoaded: gameMap !== null,
     mapSize: gameMap ? gameMap.size : null,
     totalPlayers: players.length,
@@ -659,6 +685,7 @@ app.get("/players", (req, res) => {
 
   res.json({
     success: true,
+    gameId: GAME_ID,
     players: playerData,
     count: playerData.length,
   });
@@ -669,32 +696,108 @@ async function initializeGame() {
   console.log("\n🎮 Initializing Game Server");
   console.log("============================");
 
+  // Parse command line arguments for gameId
+  const args = process.argv.slice(2);
+  const gameIdArg = args.find((arg) => arg.startsWith("--gameId="));
+  GAME_ID = gameIdArg ? gameIdArg.split("=")[1] : args[0];
+
+  if (!GAME_ID) {
+    console.error("❌ Game ID is required");
+    console.log("Usage: node game.js <gameId>");
+    console.log("   or: node game.js --gameId=<gameId>");
+    process.exit(1);
+  }
+
+  console.log(`🎮 Starting server for Game ID: ${GAME_ID}`);
+
   // Load game map
-  if (!loadGameMap()) {
+  if (!loadGameMap(GAME_ID)) {
     console.error("❌ Failed to initialize: Could not load map");
     process.exit(1);
   }
 
   // Load reveal seed
-  if (!loadRevealSeed()) {
+  if (!loadRevealSeed(GAME_ID)) {
     console.error("❌ Failed to initialize: Could not load reveal seed");
     process.exit(1);
   }
 
   // Load players from contract
-  if (!(await loadPlayers())) {
+  if (!(await loadPlayers(GAME_ID))) {
     console.error("❌ Failed to initialize: Could not load players");
     process.exit(1);
   }
 
+  // Function to save final scores when server is closed
+  function saveFinalScores() {
+    try {
+      console.log("\n💾 Saving final player scores...");
+
+      const playerData = [];
+      players.forEach((address) => {
+        const position = playerPositions.get(address.toLowerCase());
+        const stats = playerStats.get(address.toLowerCase());
+        if (position && stats) {
+          playerData.push({
+            address: address,
+            position: position,
+            tile: gameMap.land[position.y][position.x],
+            score: stats.score,
+            movesRemaining: stats.movesRemaining,
+            minesRemaining: stats.minesRemaining,
+          });
+        }
+      });
+
+      const scoresData = {
+        gameId: GAME_ID,
+        players: playerData,
+        count: playerData.length,
+        savedAt: new Date().toISOString(),
+      };
+
+      fs.writeFileSync(
+        `scores_${GAME_ID}.txt`,
+        JSON.stringify(scoresData, null, 2)
+      );
+      console.log(`✅ Final scores saved to scores_${GAME_ID}.txt`);
+      console.log(
+        `🎯 Game ${GAME_ID} data saved. You can now run 'node payout.js ${GAME_ID}' to distribute prizes!`
+      );
+    } catch (error) {
+      console.error("❌ Failed to save final scores:", error.message);
+    }
+  }
+
+  // Set up graceful shutdown handlers
+  const gracefulShutdown = (signal) => {
+    console.log(`\n🛑 Received ${signal}. Shutting down gracefully...`);
+    saveFinalScores();
+    console.log("👋 Server shutdown complete.");
+    process.exit(0);
+  };
+
+  // Handle process termination signals
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
   // Check for SSL credentials and configure server accordingly
   const hasSSL = checkSSLCredentials();
   const PORT = 8000; // Always use port 8000
-  const PROTOCOL = hasSSL ? 'https' : 'http';
+  const PROTOCOL = hasSSL ? "https" : "http";
 
   const serverCallback = () => {
-    console.log(`\n🚀 Game API Server running on ${PROTOCOL}://localhost:${PORT}`);
-    console.log(`🔒 SSL: ${hasSSL ? 'ENABLED (server.key & server.cert found)' : 'DISABLED (no SSL credentials found)'}`);
+    console.log(
+      `\n🚀 Game API Server running on ${PROTOCOL}://localhost:${PORT}`
+    );
+    console.log(`🎮 Game ID: ${GAME_ID}`);
+    console.log(
+      `🔒 SSL: ${
+        hasSSL
+          ? "ENABLED (server.key & server.cert found)"
+          : "DISABLED (no SSL credentials found)"
+      }`
+    );
     console.log(`📊 Map size: ${gameMap.size}x${gameMap.size}`);
     console.log(`👥 Players loaded: ${players.length}`);
     console.log(`🔑 Reveal seed: ${revealSeed.substring(0, 10)}...`);
@@ -720,16 +823,21 @@ async function initializeGame() {
     console.log(
       `GET  ${PROTOCOL}://localhost:${PORT}/map              - Get 3x3 local view + stats`
     );
-    console.log(`POST ${PROTOCOL}://localhost:${PORT}/move             - Move player`);
+    console.log(
+      `POST ${PROTOCOL}://localhost:${PORT}/move             - Move player`
+    );
     console.log(
       `POST ${PROTOCOL}://localhost:${PORT}/mine             - Mine for points`
     );
     console.log("\nPublic:");
-    console.log(`GET  ${PROTOCOL}://localhost:${PORT}/status           - Game status`);
+    console.log(
+      `GET  ${PROTOCOL}://localhost:${PORT}/status           - Game status`
+    );
     console.log(
       `GET  ${PROTOCOL}://localhost:${PORT}/players          - All player positions + stats`
     );
     console.log("\n✅ Server ready!");
+    console.log("\n💡 Press Ctrl+C to stop the server and save final scores");
   };
 
   if (hasSSL) {
@@ -739,20 +847,24 @@ async function initializeGame() {
         key: fs.readFileSync("server.key"),
         cert: fs.readFileSync("server.cert"),
       };
-      
-      https.createServer(httpsOptions, app).listen(PORT, '0.0.0.0', serverCallback);
+
+      https
+        .createServer(httpsOptions, app)
+        .listen(PORT, "0.0.0.0", serverCallback);
     } catch (error) {
       console.error("❌ Failed to start HTTPS server:", error.message);
       console.log("🔄 Falling back to HTTP server...");
-             app.listen(8000, '0.0.0.0', () => {
-         console.log(`\n🚀 Game API Server running on http://localhost:8000 (SSL fallback)`);
-         console.log(`🔒 SSL: FAILED (could not read SSL credentials)`);
-         serverCallback();
-       });
+      app.listen(8000, "0.0.0.0", () => {
+        console.log(
+          `\n🚀 Game API Server running on http://localhost:8000 (SSL fallback)`
+        );
+        console.log(`🔒 SSL: FAILED (could not read SSL credentials)`);
+        serverCallback();
+      });
     }
   } else {
     // Create HTTP server
-    app.listen(PORT, '0.0.0.0', serverCallback);
+    app.listen(PORT, "0.0.0.0", serverCallback);
   }
 }
 
