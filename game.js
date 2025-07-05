@@ -70,9 +70,12 @@ const GAME_MANAGEMENT_ABI = [
     name: "getGameInfo",
     outputs: [
       { name: "gamemaster", type: "address" },
+      { name: "creator", type: "address" },
       { name: "stakeAmount", type: "uint256" },
       { name: "open", type: "bool" },
       { name: "playerCount", type: "uint256" },
+      { name: "hasOpened", type: "bool" },
+      { name: "hasClosed", type: "bool" },
     ],
     stateMutability: "view",
     type: "function",

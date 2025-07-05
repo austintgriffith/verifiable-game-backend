@@ -22,10 +22,38 @@ const PAYOUT_ABI = [
     name: "getGameInfo",
     outputs: [
       { name: "gamemaster", type: "address" },
+      { name: "creator", type: "address" },
       { name: "stakeAmount", type: "uint256" },
       { name: "open", type: "bool" },
       { name: "playerCount", type: "uint256" },
+      { name: "hasOpened", type: "bool" },
+      { name: "hasClosed", type: "bool" },
     ],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getPayoutInfo",
+    outputs: [
+      { name: "winners", type: "address[]" },
+      { name: "payoutAmount", type: "uint256" },
+      { name: "hasPaidOut", type: "bool" },
+    ],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getPlayers",
+    outputs: [{ name: "", type: "address[]" }],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getPlayerCount",
+    outputs: [{ name: "", type: "uint256" }],
     stateMutability: "view",
     type: "function",
   },
@@ -94,6 +122,28 @@ async function main() {
 
     // Get game info to calculate prize pool
     console.log("\n📊 Fetching game information...");
+
+    // Check if already paid out
+    const payoutInfo = await publicClient.readContract({
+      address: contractAddress,
+      abi: PAYOUT_ABI,
+      functionName: "getPayoutInfo",
+      args: [BigInt(gameId)],
+    });
+
+    const [existingWinners, existingPayoutAmount, hasPaidOut] = payoutInfo;
+    console.log(`Game Status: ${hasPaidOut ? "ALREADY PAID OUT" : "UNPAID"}`);
+
+    if (hasPaidOut) {
+      console.log("❌ Game has already been paid out!");
+      console.log(`Previous winners: ${existingWinners.join(", ")}`);
+      console.log(
+        `Previous payout amount: ${Number(existingPayoutAmount) / 1e18} ETH`
+      );
+      process.exit(1);
+    }
+
+    // Get game info using the corrected ABI
     const gameInfo = await publicClient.readContract({
       address: contractAddress,
       abi: PAYOUT_ABI,
@@ -101,30 +151,41 @@ async function main() {
       args: [BigInt(gameId)],
     });
 
-    const [gamemaster, stakeAmount, open, playerCount] = gameInfo;
+    const [
+      gamemaster,
+      creator,
+      stakeAmount,
+      open,
+      playerCount,
+      hasOpened,
+      hasClosed,
+    ] = gameInfo;
     console.log(`Gamemaster: ${gamemaster}`);
+    console.log(`Creator: ${creator}`);
     console.log(`Stake Amount: ${Number(stakeAmount) / 1e18} ETH`);
     console.log(`Game Status: ${open ? "OPEN" : "CLOSED"}`);
     console.log(`Player Count: ${playerCount.toString()}`);
+    console.log(`Has Opened: ${hasOpened}`);
+    console.log(`Has Closed: ${hasClosed}`);
 
     // Calculate total prize pool for this game
     const gamePrizePool = BigInt(stakeAmount) * BigInt(playerCount);
     console.log(`🏆 Game Prize Pool: ${Number(gamePrizePool) / 1e18} ETH`);
 
     // Read final player scores from file
-    const players = readPlayerScores(gameId);
+    const playerScores = readPlayerScores(gameId);
 
-    if (players.length === 0) {
+    if (playerScores.length === 0) {
       console.log("❌ No players found in the game");
       process.exit(1);
     }
 
-    console.log(`✅ Found ${players.length} players`);
+    console.log(`✅ Found ${playerScores.length} players`);
 
     // Display all player scores
     console.log("\n🏆 Player Leaderboard:");
     console.log("========================");
-    const sortedPlayers = players.sort((a, b) => b.score - a.score);
+    const sortedPlayers = playerScores.sort((a, b) => b.score - a.score);
     sortedPlayers.forEach((player, index) => {
       const rank = index + 1;
       const medal =
@@ -135,31 +196,33 @@ async function main() {
     });
 
     // Find winners
-    const { winners, highestScore } = findWinners(players);
+    const { winners: foundWinners, highestScore } = findWinners(playerScores);
 
-    if (winners.length === 0) {
+    if (foundWinners.length === 0) {
       console.log("❌ No winners found");
       process.exit(1);
     }
 
     console.log(`\n🎯 Winners (${highestScore} points):`);
-    winners.forEach((winner, index) => {
+    foundWinners.forEach((winner, index) => {
       console.log(`${index + 1}. ${winner}`);
     });
 
-    if (winners.length > 1) {
-      console.log(`🤝 There's a ${winners.length}-way tie for first place!`);
+    if (foundWinners.length > 1) {
+      console.log(
+        `🤝 There's a ${foundWinners.length}-way tie for first place!`
+      );
     }
 
     // Check contract balance before payout
-    const contractBalance = await publicClient.getBalance({
+    const currentContractBalance = await publicClient.getBalance({
       address: contractAddress,
     });
 
-    const contractBalanceEth = Number(contractBalance) / 1e18;
+    const contractBalanceEth = Number(currentContractBalance) / 1e18;
     console.log(`\n💸 Contract Balance: ${contractBalanceEth.toFixed(6)} ETH`);
 
-    if (contractBalance < gamePrizePool) {
+    if (currentContractBalance < gamePrizePool) {
       console.log(
         "❌ Contract doesn't have enough funds for this game's payout"
       );
@@ -171,21 +234,21 @@ async function main() {
       process.exit(1);
     }
 
-    const amountPerWinner = gamePrizePool / BigInt(winners.length);
+    const amountPerWinner = gamePrizePool / BigInt(foundWinners.length);
     const amountPerWinnerEth = Number(amountPerWinner) / 1e18;
 
     console.log(`💰 Payout per winner: ${amountPerWinnerEth.toFixed(6)} ETH`);
 
     // Call payout function
     console.log(
-      `\n🚀 Calling payout function for game ${gameId} with ${winners.length} winner(s)...`
+      `\n🚀 Calling payout function for game ${gameId} with ${foundWinners.length} winner(s)...`
     );
 
     const payoutTxHash = await walletClient.writeContract({
       address: contractAddress,
       abi: PAYOUT_ABI,
       functionName: "payout",
-      args: [BigInt(gameId), winners],
+      args: [BigInt(gameId), foundWinners],
     });
 
     console.log(`Payout transaction: ${payoutTxHash}`);
@@ -202,14 +265,14 @@ async function main() {
       console.log(`Gas used: ${receipt.gasUsed.toString()}`);
 
       // Verify new contract balance
-      const newBalance = await publicClient.getBalance({
+      const finalContractBalance = await publicClient.getBalance({
         address: contractAddress,
       });
-      const newBalanceEth = Number(newBalance) / 1e18;
+      const newBalanceEth = Number(finalContractBalance) / 1e18;
       console.log(`\n💰 New contract balance: ${newBalanceEth.toFixed(6)} ETH`);
 
       console.log(
-        `\n🎉 Successfully paid out ${winners.length} winner(s) for game ${gameId}!`
+        `\n🎉 Successfully paid out ${foundWinners.length} winner(s) for game ${gameId}!`
       );
       console.log(`💸 Total distributed: ${Number(gamePrizePool) / 1e18} ETH`);
       console.log(`🎯 Amount per winner: ${amountPerWinnerEth.toFixed(6)} ETH`);
