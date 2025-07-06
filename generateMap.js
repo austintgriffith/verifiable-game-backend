@@ -45,16 +45,16 @@ class DeterministicDice {
 }
 
 class GameLandGenerator {
-  constructor(dice) {
+  constructor(dice, size = 20) {
     this.dice = dice;
     this.land = [];
-    this.size = 20;
+    this.size = size;
   }
 
   generateLand() {
-    console.log("Generating 20x20 land...");
+    console.log(`Generating ${this.size}x${this.size} land...`);
 
-    // Initialize 20x20 array
+    // Initialize dynamic size array
     for (let y = 0; y < this.size; y++) {
       this.land[y] = [];
       for (let x = 0; x < this.size; x++) {
@@ -79,9 +79,9 @@ class GameLandGenerator {
   }
 
   placeStartingPosition() {
-    // Roll 2 dice for x coordinate, mod 20
+    // Roll 2 dice for x coordinate, mod size
     const x = this.dice.roll(2) % this.size;
-    // Roll 2 dice for y coordinate, mod 20
+    // Roll 2 dice for y coordinate, mod size
     const y = this.dice.roll(2) % this.size;
 
     console.log(`Placing starting position at (${x}, ${y})`);

@@ -44,14 +44,13 @@ let currentGameId = null;
 let expressApp = null;
 let httpServer = null;
 let httpsServer = null;
-
-// Global blockchain clients (created once at startup)
+let lastWaitingLogs = new Map(); // Map of gameId -> timestamp of last waiting log
+let payoutRetryCount = new Map(); // Map of gameId -> retry count
+let payoutLastRetryTime = new Map(); // Map of gameId -> timestamp of last retry
 let globalAccount = null;
 let globalPublicClient = null;
 let globalWalletClient = null;
 let globalContractAddress = null;
-
-// Game statistics
 let completedGamesCount = 0;
 
 // Contract ABIs
@@ -210,6 +209,24 @@ function log(message, gameId = null) {
   console.log(`${timestamp} ${prefix} ${message}`);
 }
 
+// Helper function to convert BigInt values to numbers for JSON serialization
+function safeJsonConvert(obj) {
+  if (typeof obj === "bigint") {
+    return Number(obj);
+  }
+  if (obj && typeof obj === "object") {
+    if (Array.isArray(obj)) {
+      return obj.map(safeJsonConvert);
+    }
+    const converted = {};
+    for (const [key, value] of Object.entries(obj)) {
+      converted[key] = safeJsonConvert(value);
+    }
+    return converted;
+  }
+  return obj;
+}
+
 function generateRandomReveal() {
   const randomBytes = new Uint8Array(32);
   crypto.getRandomValues(randomBytes);
@@ -362,6 +379,50 @@ async function payoutGame(gameId) {
       return true;
     }
 
+    // Check retry logic
+    const retryCount = payoutRetryCount.get(gameId) || 0;
+    const lastRetryTime = payoutLastRetryTime.get(gameId) || 0;
+    const now = Date.now();
+    const MAX_RETRIES = 10;
+    const RETRY_BACKOFF_MS = Math.min(
+      5000 * Math.pow(2, retryCount - 1),
+      300000
+    ); // Exponential backoff, max 5 minutes
+
+    if (retryCount >= MAX_RETRIES) {
+      log(`❌ Payout failed after ${MAX_RETRIES} retries - giving up`, gameId);
+      log(
+        `💡 Please manually fund the gamemaster account and restart the service`,
+        gameId
+      );
+
+      // Move to next phase anyway to prevent infinite loop
+      log(
+        `⚠️ Skipping to reveal phase due to persistent payout failures`,
+        gameId
+      );
+
+      // Clean up retry tracking
+      payoutRetryCount.delete(gameId);
+      payoutLastRetryTime.delete(gameId);
+
+      // Update game state to indicate payout was skipped
+      const gameState = gameStates.get(gameId);
+      if (gameState) {
+        gameState.payoutSkipped = true;
+        gameState.phase = GamePhase.PAYOUT_COMPLETE;
+        gameStates.set(gameId, gameState);
+      }
+
+      return true; // Return true to move to next phase
+    }
+
+    // Check if we should wait before retrying
+    if (retryCount > 0 && now - lastRetryTime < RETRY_BACKOFF_MS) {
+      // Still in backoff period, don't retry yet
+      return false;
+    }
+
     // Load player scores
     const playerScores = loadGameScores(gameId);
     if (playerScores.length === 0) {
@@ -397,14 +458,73 @@ async function payoutGame(gameId) {
     });
 
     if (receipt.status === "success") {
-      log(`Payout successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
+      log(
+        `✅ Payout successful! Gas used: ${receipt.gasUsed.toString()}`,
+        gameId
+      );
+
+      // Clear retry tracking on success
+      payoutRetryCount.delete(gameId);
+      payoutLastRetryTime.delete(gameId);
+
       return true;
     } else {
-      log(`Payout failed!`, gameId);
+      log(
+        `❌ Payout transaction failed with status: ${receipt.status}`,
+        gameId
+      );
+
+      // Increment retry count
+      payoutRetryCount.set(gameId, retryCount + 1);
+      payoutLastRetryTime.set(gameId, now);
+
       return false;
     }
   } catch (error) {
-    log(`Error in payout phase: ${error.message}`, gameId);
+    const retryCount = payoutRetryCount.get(gameId) || 0;
+    const now = Date.now();
+
+    // Check if this is an insufficient funds error
+    if (
+      error.message.includes("Sender doesn't have enough funds") ||
+      error.message.includes("insufficient funds")
+    ) {
+      log(
+        `💰 Insufficient funds for payout (attempt ${retryCount + 1}/${10})`,
+        gameId
+      );
+      log(`💡 Gamemaster account needs more ETH for gas fees`, gameId);
+
+      // Log the specific amounts for debugging
+      const errorMsg = error.message;
+      const balanceMatch = errorMsg.match(/sender's balance is: (\d+)/);
+      const costMatch = errorMsg.match(/max upfront cost is: (\d+)/);
+
+      if (balanceMatch && costMatch) {
+        const balance = parseInt(balanceMatch[1]);
+        const cost = parseInt(costMatch[1]);
+        log(`💰 Current balance: ${(balance / 1e18).toFixed(6)} ETH`, gameId);
+        log(`💰 Required for tx: ${(cost / 1e18).toFixed(6)} ETH`, gameId);
+        log(
+          `💰 Need additional: ${((cost - balance) / 1e18).toFixed(6)} ETH`,
+          gameId
+        );
+      }
+
+      // Use longer backoff for insufficient funds
+      const BACKOFF_MS = Math.min(10000 * Math.pow(2, retryCount), 600000); // 10s to 10 minutes
+      log(
+        `⏳ Will retry in ${Math.round(BACKOFF_MS / 1000)} seconds...`,
+        gameId
+      );
+    } else {
+      log(`❌ Error in payout phase: ${error.message}`, gameId);
+    }
+
+    // Increment retry count
+    payoutRetryCount.set(gameId, retryCount + 1);
+    payoutLastRetryTime.set(gameId, now);
+
     return false;
   }
 }
@@ -585,6 +705,19 @@ async function updateGameState(gameId) {
   }
 }
 
+function shouldLogWaitingMessage(gameId) {
+  const now = Date.now();
+  const lastLog = lastWaitingLogs.get(gameId) || 0;
+  const timeSinceLastLog = now - lastLog;
+  const WAITING_LOG_INTERVAL = 30000; // 30 seconds
+
+  if (timeSinceLastLog >= WAITING_LOG_INTERVAL) {
+    lastWaitingLogs.set(gameId, now);
+    return true;
+  }
+  return false;
+}
+
 function logGameState(gameState, verbose = false) {
   const gameId = gameState.gameId;
 
@@ -642,11 +775,17 @@ async function processGamePhase(gameId) {
     GamePhase.PAYOUT_COMPLETE,
   ].includes(gameState.phase);
 
-  // Log state (verbose if phase changed or action needed)
-  if (phaseChanged || needsAction) {
-    logGameState(gameState, true);
-  } else {
-    logGameState(gameState, false);
+  // Determine if we should log this cycle
+  const shouldLogThisCycle =
+    phaseChanged || needsAction || shouldLogWaitingMessage(gameId);
+
+  // Log state if needed
+  if (shouldLogThisCycle) {
+    if (phaseChanged || needsAction) {
+      logGameState(gameState, true);
+    } else {
+      logGameState(gameState, false);
+    }
   }
 
   switch (gameState.phase) {
@@ -662,16 +801,27 @@ async function processGamePhase(gameId) {
       break;
 
     case GamePhase.COMMITTED:
-      // Wait for game to be closed
-      log(`⏳ Waiting for game to be closed by creator...`, gameId);
+      // Wait for game to be closed - only log occasionally
+      if (shouldLogThisCycle && !needsAction) {
+        log(`⏳ Waiting for game to be closed by creator...`, gameId);
+      }
       break;
 
     case GamePhase.CLOSED:
-      // Start game server
-      log(`🎯 Action needed: Start game server`, gameId);
+      // Start game server - but only if no other server is running
       if (activeGameServer === gameId) {
         log(`✅ Game server already running for this game`, gameId);
+      } else if (activeGameServer !== null) {
+        // Another game's server is running, wait our turn
+        if (shouldLogThisCycle) {
+          log(
+            `⏳ Waiting for server slot (Game ${activeGameServer} currently active)`,
+            gameId
+          );
+        }
       } else {
+        // No active server, we can start ours
+        log(`🎯 Action needed: Start game server`, gameId);
         const serverStarted = await startGameServer(gameId);
         if (!serverStarted) {
           // Game was already finished, update phase
@@ -695,17 +845,58 @@ async function processGamePhase(gameId) {
 
     case GamePhase.GAME_FINISHED:
       // Run payout
-      log(`🎯 Action needed: Execute payout`, gameId);
+      const retryCount = payoutRetryCount.get(gameId) || 0;
+      const lastRetryTime = payoutLastRetryTime.get(gameId) || 0;
+      const now = Date.now();
+
+      if (retryCount > 0) {
+        const RETRY_BACKOFF_MS = Math.min(
+          5000 * Math.pow(2, retryCount - 1),
+          300000
+        );
+        const timeUntilRetry = Math.max(
+          0,
+          RETRY_BACKOFF_MS - (now - lastRetryTime)
+        );
+
+        if (timeUntilRetry > 0) {
+          // Still in backoff period
+          if (shouldLogThisCycle) {
+            log(
+              `⏳ Payout retry ${retryCount}/10 in ${Math.round(
+                timeUntilRetry / 1000
+              )}s (insufficient funds)`,
+              gameId
+            );
+          }
+          break;
+        }
+      }
+
+      log(
+        `🎯 Action needed: Execute payout${
+          retryCount > 0 ? ` (retry ${retryCount + 1}/10)` : ""
+        }`,
+        gameId
+      );
       const payoutSuccess = await payoutGame(gameId);
       if (payoutSuccess) {
         log(`✅ Payout phase completed`, gameId);
       } else {
-        log(`❌ Payout phase failed`, gameId);
+        const newRetryCount = payoutRetryCount.get(gameId) || 0;
+        if (newRetryCount < 10) {
+          log(`❌ Payout phase failed (will retry)`, gameId);
+        }
       }
       break;
 
     case GamePhase.PAYOUT_COMPLETE:
       // Run reveal
+      const gameState = gameStates.get(gameId);
+      if (gameState && gameState.payoutSkipped) {
+        log(`⚠️ Note: Payout was skipped due to insufficient funds`, gameId);
+        log(`💡 Winners were not paid out on-chain`, gameId);
+      }
       log(`🎯 Action needed: Reveal hash`, gameId);
       const revealSuccess = await revealGame(gameId);
       if (revealSuccess) {
@@ -740,6 +931,19 @@ async function processGamePhase(gameId) {
         gameId
       );
       gameStates.delete(gameId);
+      // Clean up logging throttle data
+      lastWaitingLogs.delete(gameId);
+      // Clean up retry tracking data
+      payoutRetryCount.delete(gameId);
+      payoutLastRetryTime.delete(gameId);
+      // Clean up timer warning keys for this game
+      const keysToDelete = [];
+      for (const [key, value] of lastWaitingLogs.entries()) {
+        if (key.startsWith("timer_warning_")) {
+          keysToDelete.push(key);
+        }
+      }
+      keysToDelete.forEach((key) => lastWaitingLogs.delete(key));
       break;
 
     default:
@@ -798,10 +1002,22 @@ async function startGameServer(gameId) {
       const revealValue = loadRevealValue(gameId);
       log(`✅ Found reveal value: ${revealValue.substring(0, 10)}...`, gameId);
 
-      // Generate map using reveal seed
-      log(`🗺️ Generating game map...`, gameId);
+      // Get players first to determine map size
+      const contractPlayers = await globalPublicClient.readContract({
+        address: globalContractAddress,
+        abi: FULL_CONTRACT_ABI,
+        functionName: "getPlayers",
+        args: [BigInt(gameId)],
+      });
+
+      const calculatedMapSize = MAP_MULTIPLIER * contractPlayers.length;
+      log(
+        `🗺️ Generating ${calculatedMapSize}x${calculatedMapSize} map for ${contractPlayers.length} players...`,
+        gameId
+      );
+
       const dice = new DeterministicDice(revealValue);
-      const mapGenerator = new GameLandGenerator(dice);
+      const mapGenerator = new GameLandGenerator(dice, calculatedMapSize);
 
       mapGenerator.generateLand();
       mapGenerator.placeStartingPosition();
@@ -881,6 +1097,15 @@ async function stopGameServer() {
   }
   gameStartTime = null;
 
+  // Clean up timer warning keys when stopping server
+  const keysToDelete = [];
+  for (const [key, value] of lastWaitingLogs.entries()) {
+    if (key.startsWith("timer_warning_")) {
+      keysToDelete.push(key);
+    }
+  }
+  keysToDelete.forEach((key) => lastWaitingLogs.delete(key));
+
   if (activeGameServer) {
     log(`Game server stopped for game ${activeGameServer}`, activeGameServer);
     activeGameServer = null;
@@ -902,12 +1127,17 @@ async function monitorGameProgress(gameId) {
       log(`⏰ Timer expired! Force finishing game...`, gameId);
       forceFinishGameOnTimer(gameId);
     } else if (gameStartTime !== null) {
-      // Log timer warnings at key intervals
+      // Log timer warnings at key intervals (but only once per warning)
       const warningTimes = [60, 30, 10, 5];
       const currentTime = Math.floor(timeRemaining);
 
       if (warningTimes.includes(currentTime)) {
-        log(`⏰ Timer warning: ${currentTime} seconds remaining!`, gameId);
+        // Only log if we haven't logged this warning yet (avoid spam)
+        const warningKey = `timer_warning_${currentTime}`;
+        if (!lastWaitingLogs.has(warningKey)) {
+          log(`⏰ Timer warning: ${currentTime} seconds remaining!`, gameId);
+          lastWaitingLogs.set(warningKey, Date.now());
+        }
       }
     }
 
@@ -1136,6 +1366,7 @@ let gameTimerDuration = 90; // 90 seconds
 let gameTimerInterval = null;
 
 // Game constants
+const MAP_MULTIPLIER = 4;
 const MAX_MOVES = 12;
 const MAX_MINES = 3;
 const TILE_POINTS = {
@@ -1176,8 +1407,19 @@ function isValidPlayer(address) {
   );
 }
 
-function wrapCoordinate(coord, mapSize) {
-  return ((coord % mapSize) + mapSize) % mapSize;
+function getCurrentMapSize() {
+  // If we have a loaded game map, use its size
+  if (gameMap && gameMap.size) {
+    return gameMap.size;
+  }
+  // Otherwise calculate based on current player count
+  const playerCount = players.length;
+  return playerCount > 0 ? MAP_MULTIPLIER * playerCount : MAP_MULTIPLIER;
+}
+
+function wrapCoordinate(coord, mapSize = null) {
+  const size = mapSize || getCurrentMapSize();
+  return ((coord % size) + size) % size;
 }
 
 function generateStartingPosition(playerAddress, gameId) {
@@ -1185,8 +1427,9 @@ function generateStartingPosition(playerAddress, gameId) {
   const hash = crypto.createHash("sha256").update(combined).digest("hex");
   const xHex = hash.substring(0, 8);
   const yHex = hash.substring(8, 16);
-  const x = parseInt(xHex, 16) % gameMap.size;
-  const y = parseInt(yHex, 16) % gameMap.size;
+  const mapSize = getCurrentMapSize();
+  const x = parseInt(xHex, 16) % mapSize;
+  const y = parseInt(yHex, 16) % mapSize;
   return { x, y };
 }
 
@@ -1200,6 +1443,22 @@ function getCurrentPlayerData(gameId) {
         address,
         position,
         tile: gameMap.land[position.y][position.x],
+        score: stats.score,
+        movesRemaining: stats.movesRemaining,
+        minesRemaining: stats.minesRemaining,
+      });
+    }
+  });
+  return playerData;
+}
+
+function getSanitizedPlayerData(gameId) {
+  const playerData = [];
+  players.forEach((address) => {
+    const stats = playerStats.get(address.toLowerCase());
+    if (stats) {
+      playerData.push({
+        address,
         score: stats.score,
         movesRemaining: stats.movesRemaining,
         minesRemaining: stats.minesRemaining,
@@ -1300,6 +1559,14 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json());
+
+// Override Express JSON response to handle BigInt values
+app.set("json replacer", function (key, value) {
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  return value;
+});
 
 // Authentication middleware
 function authenticateToken(req, res, next) {
@@ -1422,8 +1689,11 @@ app.get("/", (req, res) => {
     message: "Automated Game Server",
     version: "2.0.0",
     gameId: currentGameId,
-    activeGames: Array.from(gameStates.keys()),
+    activeGames: safeJsonConvert(Array.from(gameStates.keys())),
     serverStatus: "running",
+    mapSize: getCurrentMapSize(),
+    mapMultiplier: MAP_MULTIPLIER,
+    playerCount: players.length,
     timestamp: new Date().toISOString(),
     timer: {
       active: gameActive,
@@ -1451,40 +1721,9 @@ app.get("/test", (req, res) => {
     timestamp: new Date().toISOString(),
     gameLoaded: gameMap !== null,
     playersCount: players.length,
+    mapSize: getCurrentMapSize(),
+    mapMultiplier: MAP_MULTIPLIER,
   });
-});
-
-// Force finish game endpoint (for debugging)
-app.post("/admin/finish", (req, res) => {
-  if (!currentGameId) {
-    return res.status(400).json({ error: "No active game" });
-  }
-
-  try {
-    const playerData = getCurrentPlayerData(currentGameId);
-    saveGameScores(currentGameId, playerData);
-
-    // Update game state
-    const gameState = gameStates.get(currentGameId);
-    if (gameState) {
-      gameState.phase = GamePhase.GAME_FINISHED;
-      gameStates.set(currentGameId, gameState);
-    }
-
-    log(
-      `🏁 Game ${currentGameId} manually finished via admin endpoint`,
-      currentGameId
-    );
-
-    res.json({
-      success: true,
-      message: "Game finished manually",
-      gameId: currentGameId,
-      players: playerData,
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
 });
 
 app.get("/register", (req, res) => {
@@ -1640,15 +1879,49 @@ app.get("/status", (req, res) => {
   const timeRemaining = getTimeRemaining();
   const gameActive = gameStartTime !== null;
 
+  // Get retry information for debugging
+  const retryInfo = {};
+  for (const [gameId, count] of payoutRetryCount.entries()) {
+    const lastRetry = payoutLastRetryTime.get(gameId) || 0;
+    const now = Date.now();
+    const backoffMs = Math.min(5000 * Math.pow(2, count - 1), 300000);
+    const timeUntilRetry = Math.max(0, backoffMs - (now - lastRetry));
+
+    retryInfo[gameId] = {
+      retryCount: count,
+      maxRetries: 10,
+      timeUntilRetry: Math.round(timeUntilRetry / 1000),
+      lastRetryTime: new Date(lastRetry).toISOString(),
+    };
+  }
+
+  // Convert game states to safe JSON format (handling BigInt values)
+  const safeGameStates = Object.fromEntries(
+    Array.from(gameStates.entries()).map(([id, state]) => [
+      id,
+      safeJsonConvert({
+        phase: state.phase,
+        payoutSkipped: state.payoutSkipped || false,
+        playerCount: state.playerCount,
+        stakeAmount: state.stakeAmount,
+        hasOpened: state.hasOpened,
+        hasClosed: state.hasClosed,
+        hasCommitted: state.hasCommitted,
+        hasRevealed: state.hasRevealed,
+        hasPaidOut: state.hasPaidOut,
+      }),
+    ])
+  );
+
   res.json({
     success: true,
     gameId: currentGameId,
     activeGames: Array.from(gameStates.keys()),
     gameLoaded: gameMap !== null,
-    mapSize: gameMap ? gameMap.size : null,
+    mapSize: getCurrentMapSize(),
+    mapMultiplier: MAP_MULTIPLIER,
     totalPlayers: players.length,
     players,
-    revealSeed,
     serverTime: new Date().toISOString(),
     timer: {
       active: gameActive,
@@ -1657,11 +1930,13 @@ app.get("/status", (req, res) => {
       timeElapsed: gameActive ? gameTimerDuration - timeRemaining : 0,
       startTime: gameStartTime,
     },
+    retryInfo: retryInfo,
+    gameStates: safeGameStates,
   });
 });
 
 app.get("/players", (req, res) => {
-  const playerData = getCurrentPlayerData(currentGameId);
+  const playerData = getSanitizedPlayerData(currentGameId);
   const timeRemaining = getTimeRemaining();
 
   res.json({
@@ -1670,6 +1945,8 @@ app.get("/players", (req, res) => {
     players: playerData,
     count: playerData.length,
     timeRemaining: timeRemaining,
+    mapSize: getCurrentMapSize(),
+    mapMultiplier: MAP_MULTIPLIER,
   });
 });
 
@@ -1800,7 +2077,28 @@ async function gameLoop() {
           quietCycles = 0;
         }
 
-        for (const gameId of gameIds) {
+        // Process games in order, prioritizing running games first
+        const sortedGameIds = gameIds.sort((a, b) => {
+          const stateA = gameStates.get(a);
+          const stateB = gameStates.get(b);
+
+          // Running games get highest priority
+          if (
+            stateA?.phase === GamePhase.GAME_RUNNING &&
+            stateB?.phase !== GamePhase.GAME_RUNNING
+          )
+            return -1;
+          if (
+            stateB?.phase === GamePhase.GAME_RUNNING &&
+            stateA?.phase !== GamePhase.GAME_RUNNING
+          )
+            return 1;
+
+          // Then by game ID (lower numbers first)
+          return parseInt(a) - parseInt(b);
+        });
+
+        for (const gameId of sortedGameIds) {
           await processGamePhase(gameId);
         }
 

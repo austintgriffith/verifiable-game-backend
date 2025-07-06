@@ -5,7 +5,10 @@ Base URL: http://localhost:8000
 
 OVERVIEW
 --------
-This is a 20x20 grid-based exploration game where players move around a map with different land types.
+This is a dynamic grid-based exploration game where players move around a map with different land types.
+The map size scales automatically based on the number of players (multiplier × player count).
+With the default multiplier of 5: 1 player = 5×5 map, 2 players = 10×10 map, 3 players = 15×15 map, etc.
+Game operators can adjust the MAP_MULTIPLIER constant in the code to change scaling behavior.
 Each player has a deterministic starting position based on their wallet address + reveal seed.
 Players can only see a 3x3 local view centered on their current position.
 
@@ -108,6 +111,9 @@ Response:
   "gameId": "12345",
   "activeGames": ["12345"],
   "serverStatus": "running",
+  "mapSize": 15,
+  "mapMultiplier": 5,
+  "playerCount": 3,
   "timestamp": "2025-06-29T11:55:03.109Z",
   "timer": {
     "active": true,
@@ -136,7 +142,9 @@ Response:
   "gameId": "12345",
   "timestamp": "2025-06-29T11:55:03.109Z",
   "gameLoaded": true,
-  "playersCount": 2
+  "playersCount": 2,
+  "mapSize": 10,
+  "mapMultiplier": 5
 }
 
 3. GET /status
@@ -149,10 +157,10 @@ Response:
   "gameId": "12345",
   "activeGames": ["12345"],
   "gameLoaded": true,
-  "mapSize": 20,
+  "mapSize": 10,
+  "mapMultiplier": 5,
   "totalPlayers": 2,
   "players": ["0x05937Df8ca0636505d92Fd769d303A3D461587ed", "0x1a39C55e6333025A3Be3768873C846632ACDb6f5"],
-  "revealSeed": "0x5d1fea4f13119a5c07e66d501706ea199ab91c3b1a0da9b7f087e22cd675524c",
   "serverTime": "2025-06-29T11:55:03.109Z",
   "timer": {
     "active": true,
@@ -183,23 +191,23 @@ Response:
   "player": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
   "localView": [
     [
-      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 2}},
-      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 2}}, 
-      {"tile": 3, "player": false, "coordinates": {"x": 19, "y": 2}}
+      {"tile": 1, "player": false, "coordinates": {"x": 7, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 8, "y": 2}}, 
+      {"tile": 3, "player": false, "coordinates": {"x": 9, "y": 2}}
     ],
     [
-      {"tile": 2, "player": false, "coordinates": {"x": 17, "y": 3}},
-      {"tile": 1, "player": true, "coordinates": {"x": 18, "y": 3}},
-      {"tile": 1, "player": false, "coordinates": {"x": 19, "y": 3}}
+      {"tile": 2, "player": false, "coordinates": {"x": 7, "y": 3}},
+      {"tile": 1, "player": true, "coordinates": {"x": 8, "y": 3}},
+      {"tile": 1, "player": false, "coordinates": {"x": 9, "y": 3}}
     ],
     [
-      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 4}},
-      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 4}},
-      {"tile": 2, "player": false, "coordinates": {"x": 19, "y": 4}}
+      {"tile": 1, "player": false, "coordinates": {"x": 7, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 8, "y": 4}},
+      {"tile": 2, "player": false, "coordinates": {"x": 9, "y": 4}}
     ]
   ],
-  "position": {"x": 18, "y": 3},
-  "mapSize": 20,
+  "position": {"x": 8, "y": 3},
+  "mapSize": 10,
   "score": 15,
   "movesRemaining": 8,
   "minesRemaining": 1,
@@ -238,23 +246,23 @@ Response:
   "success": true,
   "player": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
   "direction": "west",
-  "newPosition": {"x": 17, "y": 3},
+  "newPosition": {"x": 7, "y": 3},
   "tile": 2,
   "localView": [
     [
-      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 2}},
-      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 2}},
-      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 2}}
+      {"tile": 1, "player": false, "coordinates": {"x": 6, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 7, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 8, "y": 2}}
     ],
     [
-      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 3}},
-      {"tile": 2, "player": true, "coordinates": {"x": 17, "y": 3}},
-      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 3}}
+      {"tile": 1, "player": false, "coordinates": {"x": 6, "y": 3}},
+      {"tile": 2, "player": true, "coordinates": {"x": 7, "y": 3}},
+      {"tile": 1, "player": false, "coordinates": {"x": 8, "y": 3}}
     ],
     [
-      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 4}},
-      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 4}},
-      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 4}}
+      {"tile": 1, "player": false, "coordinates": {"x": 6, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 7, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 8, "y": 4}}
     ]
   ],
   "score": 15,
@@ -290,7 +298,7 @@ Response:
 {
   "success": true,
   "player": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
-  "position": {"x": 17, "y": 3},
+  "position": {"x": 7, "y": 3},
   "tile": 2,
   "pointsEarned": 5,
   "totalScore": 20,
@@ -299,19 +307,19 @@ Response:
   "timeRemaining": 65,
   "localView": [
     [
-      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 2}},
-      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 2}},
-      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 2}}
+      {"tile": 1, "player": false, "coordinates": {"x": 6, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 7, "y": 2}},
+      {"tile": 1, "player": false, "coordinates": {"x": 8, "y": 2}}
     ],
     [
-      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 3}},
-      {"tile": 2, "player": true, "coordinates": {"x": 17, "y": 3}},
-      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 3}}
+      {"tile": 1, "player": false, "coordinates": {"x": 6, "y": 3}},
+      {"tile": 2, "player": true, "coordinates": {"x": 7, "y": 3}},
+      {"tile": 1, "player": false, "coordinates": {"x": 8, "y": 3}}
     ],
     [
-      {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 4}},
-      {"tile": 1, "player": false, "coordinates": {"x": 17, "y": 4}},
-      {"tile": 1, "player": false, "coordinates": {"x": 18, "y": 4}}
+      {"tile": 1, "player": false, "coordinates": {"x": 6, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 7, "y": 4}},
+      {"tile": 1, "player": false, "coordinates": {"x": 8, "y": 4}}
     ]
   ]
 }
@@ -328,7 +336,7 @@ Error Response (tile already mined):
 
 10. GET /players
 ---------------
-Get all player positions, current tiles, and game stats.
+Get all player game stats (no position or tile information for fair play).
 
 Response:
 {
@@ -337,60 +345,29 @@ Response:
   "players": [
     {
       "address": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
-      "position": {"x": 18, "y": 3},
-      "tile": 2,
       "score": 15,
       "movesRemaining": 8,
       "minesRemaining": 1
     },
     {
       "address": "0x1a39C55e6333025A3Be3768873C846632ACDb6f5", 
-      "position": {"x": 5, "y": 10},
-      "tile": 1,
       "score": 3,
       "movesRemaining": 12,
       "minesRemaining": 3
     }
   ],
   "count": 2,
-  "timeRemaining": 58
-}
-
-ADMIN ENDPOINTS
----------------
-
-11. POST /admin/finish
-----------------------
-Force finish the current game (for debugging purposes).
-
-Request Body: (empty)
-{}
-
-Response:
-{
-  "success": true,
-  "message": "Game finished manually",
-  "gameId": "12345",
-  "players": [
-    {
-      "address": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
-      "position": {"x": 18, "y": 3},
-      "tile": 2,
-      "score": 15,
-      "movesRemaining": 8,
-      "minesRemaining": 1
-    }
-  ]
-}
-
-Error Response (no active game):
-{
-  "error": "No active game"
+  "timeRemaining": 58,
+  "mapSize": 10,
+  "mapMultiplier": 5
 }
 
 GAME MECHANICS
 ==============
-- Map is 20x20 grid (coordinates 0-19) with wrapping (edges connect)
+- Map size scales dynamically: MAP_SIZE = MAP_MULTIPLIER × PLAYER_COUNT (default multiplier = 5)
+- Coordinates range from 0 to (mapSize-1) with wrapping (edges connect to opposite side)
+- Current map size and multiplier are returned in API responses as "mapSize" and "mapMultiplier" fields
+- Examples: 1 player = 5×5 map, 2 players = 10×10 map, 4 players = 20×20 map
 - Players start at deterministic positions based on their address + reveal seed
 - Players can move one square at a time in 8 directions (12 moves max)
 - Players can mine their current tile for points (3 mines max)
@@ -435,12 +412,15 @@ SAMPLE CLIENT FLOW
 
 STRATEGY TIPS
 =============
+- Map size scales with players: fewer players = smaller, more competitive maps
+- 1 player = 5×5 map (25 tiles), 2 players = 10×10 map (100 tiles), etc.
 - Scout with moves to find rare tiles (worth 10 points each)
 - Save mines for the most valuable tiles you can find
 - Balance exploration vs mining - you only get 12 moves and 3 mines
 - Common tiles (1 point) may not be worth mining unless you're sure
 - Avoid mining tiles that are already depleted (value 0) - they give no points
-- Coordinate with other players to avoid mining the same valuable tiles
+- On smaller maps (fewer players), competition for good tiles is more intense
+- On larger maps (more players), there's more room to explore but more competition
 - Work fast! You only have 90 seconds before the timer expires
 - Monitor timeRemaining in API responses to track how much time is left
 - Consider nearby tiles over distant exploration when time is running low
