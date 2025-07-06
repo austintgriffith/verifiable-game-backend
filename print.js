@@ -1,5 +1,8 @@
 import fs from "fs";
 
+// File system constants
+const SAVED_DIR = "saved";
+
 // Function to print map from saved file
 function printMapFromFile(filename = "map.txt") {
   try {
@@ -88,7 +91,7 @@ function printMapFromFile(filename = "map.txt") {
   } catch (error) {
     if (error.code === "ENOENT") {
       console.error(
-        "❌ Map file not found. Run 'node game.js' first to generate a map."
+        `❌ Map file not found. Run 'node game.js' first to generate a map in the ${SAVED_DIR} directory.`
       );
     } else {
       console.error("❌ Error reading map file:", error.message);
@@ -98,7 +101,7 @@ function printMapFromFile(filename = "map.txt") {
 
 // Check command line arguments for custom filename
 const args = process.argv.slice(2);
-const filename = args[0] || "map.txt";
+const filename = args[0] || `${SAVED_DIR}/map.txt`;
 
 console.log("🎮 Map Printer");
 console.log(`Reading from: ${filename}\n`);

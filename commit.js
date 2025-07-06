@@ -1,10 +1,21 @@
 import { createClients } from "./clients.js";
 import { keccak256, toBytes, toHex } from "viem";
-import { writeFileSync } from "fs";
+import { writeFileSync, existsSync, mkdirSync } from "fs";
 import dotenv from "dotenv";
 
 // Load environment variables
 dotenv.config();
+
+// File system constants
+const SAVED_DIR = "saved";
+
+// Ensure saved directory exists
+function ensureSavedDirectory() {
+  if (!existsSync(SAVED_DIR)) {
+    mkdirSync(SAVED_DIR, { recursive: true });
+    console.log(`📁 Created saved directory: ${SAVED_DIR}`);
+  }
+}
 
 // Contract ABI for the commit-reveal functions
 const COMMIT_REVEAL_ABI = [
@@ -139,8 +150,10 @@ async function main() {
     console.log(`Commit hash: ${commitHash}`);
 
     // Save reveal value to file for later use
-    console.log(`\n💾 Saving reveal value to reveal_${gameId}.txt...`);
-    writeFileSync(`reveal_${gameId}.txt`, revealBytes32);
+    ensureSavedDirectory();
+    const revealFilePath = `${SAVED_DIR}/reveal_${gameId}.txt`;
+    console.log(`\n💾 Saving reveal value to ${revealFilePath}...`);
+    writeFileSync(revealFilePath, revealBytes32);
     console.log("✅ Reveal value saved successfully");
 
     // Commit the hash to the contract
@@ -184,7 +197,9 @@ async function main() {
       console.log(
         `2. Run 'node reveal.js ${gameId}' to reveal and generate randomness`
       );
-      console.log(`3. The reveal value is saved in reveal_${gameId}.txt`);
+      console.log(
+        `3. The reveal value is saved in ${SAVED_DIR}/reveal_${gameId}.txt`
+      );
     } else {
       console.log(`❌ Commit failed`);
       process.exit(1);

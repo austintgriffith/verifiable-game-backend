@@ -5,6 +5,9 @@ import fs from "fs";
 // Load environment variables
 dotenv.config();
 
+// File system constants
+const SAVED_DIR = "saved";
+
 // Contract ABI for the payout function
 const PAYOUT_ABI = [
   {
@@ -62,14 +65,15 @@ const PAYOUT_ABI = [
 // Function to read player scores from saved file
 function readPlayerScores(gameId) {
   try {
-    console.log(`📊 Reading final player scores from scores_${gameId}.txt...`);
-    const scoresData = JSON.parse(
-      fs.readFileSync(`scores_${gameId}.txt`, "utf8")
-    );
+    const filePath = `${SAVED_DIR}/scores_${gameId}.txt`;
+    console.log(`📊 Reading final player scores from ${filePath}...`);
+    const scoresData = JSON.parse(fs.readFileSync(filePath, "utf8"));
     console.log(`✅ Loaded scores (saved at ${scoresData.savedAt})`);
     return scoresData.players;
   } catch (error) {
-    throw new Error(`Failed to read scores_${gameId}.txt: ${error.message}`);
+    throw new Error(
+      `Failed to read ${SAVED_DIR}/scores_${gameId}.txt: ${error.message}`
+    );
   }
 }
 
@@ -287,8 +291,8 @@ async function main() {
       console.log("💡 Make sure you're using the gamemaster private key");
     } else if (error.message.includes("No players in the game")) {
       console.log("💡 No players have joined this game yet");
-    } else if (error.message.includes("Failed to read scores_")) {
-      console.log(`💡 Could not find scores_${gameId}.txt`);
+    } else if (error.message.includes("Failed to read")) {
+      console.log(`💡 Could not find ${SAVED_DIR}/scores_${gameId}.txt`);
       console.log(
         `💡 Make sure you ran 'node game.js ${gameId}' and closed it with Ctrl+C after players finished the game`
       );

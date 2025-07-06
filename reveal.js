@@ -5,6 +5,9 @@ import dotenv from "dotenv";
 // Load environment variables
 dotenv.config();
 
+// File system constants
+const SAVED_DIR = "saved";
+
 // Contract ABI for the commit-reveal functions
 const COMMIT_REVEAL_ABI = [
   {
@@ -36,13 +39,16 @@ const COMMIT_REVEAL_ABI = [
 // Read reveal value from file
 function readRevealValue(gameId) {
   try {
-    const revealValue = readFileSync(`reveal_${gameId}.txt`, "utf8").trim();
+    const filePath = `${SAVED_DIR}/reveal_${gameId}.txt`;
+    const revealValue = readFileSync(filePath, "utf8").trim();
     if (!revealValue) {
       throw new Error("Reveal file is empty");
     }
     return revealValue;
   } catch (error) {
-    throw new Error(`Failed to read reveal_${gameId}.txt: ${error.message}`);
+    throw new Error(
+      `Failed to read ${SAVED_DIR}/reveal_${gameId}.txt: ${error.message}`
+    );
   }
 }
 
@@ -130,7 +136,9 @@ async function main() {
     }
 
     // Read reveal value from file
-    console.log(`\n📖 Reading reveal value from reveal_${gameId}.txt...`);
+    console.log(
+      `\n📖 Reading reveal value from ${SAVED_DIR}/reveal_${gameId}.txt...`
+    );
     const storedRevealValue = readRevealValue(gameId);
     console.log(`Reveal value: ${storedRevealValue}`);
 
@@ -192,9 +200,9 @@ async function main() {
       console.log("💡 The reveal value doesn't match the committed hash");
     } else if (error.message.includes("Blockhash not available")) {
       console.log("💡 The blockhash is too old (more than 256 blocks)");
-    } else if (error.message.includes("Failed to read reveal_")) {
+    } else if (error.message.includes("Failed to read")) {
       console.log(
-        "💡 Make sure reveal_<gameId>.txt exists (run commit.js first)"
+        `💡 Make sure ${SAVED_DIR}/reveal_<gameId>.txt exists (run commit.js first)`
       );
     } else if (error.message.includes("Game does not exist")) {
       console.log("💡 Game does not exist. Make sure the game ID is correct");

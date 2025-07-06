@@ -1,6 +1,17 @@
 import fs from "fs";
 import crypto from "crypto";
 
+// File system constants
+const SAVED_DIR = "saved";
+
+// Ensure saved directory exists
+function ensureSavedDirectory() {
+  if (!fs.existsSync(SAVED_DIR)) {
+    fs.mkdirSync(SAVED_DIR, { recursive: true });
+    console.log(`📁 Created saved directory: ${SAVED_DIR}`);
+  }
+}
+
 class DeterministicDice {
   constructor(revealHash) {
     // Strip 0x prefix and store as entropy
@@ -107,8 +118,10 @@ class GameLandGenerator {
       },
     };
 
-    fs.writeFileSync(filename, JSON.stringify(mapData, null, 2));
-    console.log(`Map saved to ${filename}`);
+    ensureSavedDirectory();
+    const filePath = `${SAVED_DIR}/${filename}`;
+    fs.writeFileSync(filePath, JSON.stringify(mapData, null, 2));
+    console.log(`Map saved to ${filePath}`);
   }
 
   printMapSummary() {
@@ -151,8 +164,9 @@ function main() {
     console.log(`🎮 Generating map for Game ID: ${gameId}`);
 
     // Read the reveal hash
-    const revealHash = fs.readFileSync(`reveal_${gameId}.txt`, "utf8").trim();
-    console.log(`Read reveal hash: ${revealHash}`);
+    const revealFilePath = `${SAVED_DIR}/reveal_${gameId}.txt`;
+    const revealHash = fs.readFileSync(revealFilePath, "utf8").trim();
+    console.log(`Read reveal hash from ${revealFilePath}: ${revealHash}`);
 
     // Initialize deterministic dice
     const dice = new DeterministicDice(revealHash);
@@ -181,12 +195,14 @@ function main() {
     gameGenerator.saveMapToFile(`map_${gameId}.txt`);
 
     console.log(`\n✅ Game land generation complete for game ${gameId}!`);
-    console.log(`Check map_${gameId}.txt for the generated map data.`);
+    console.log(
+      `Check ${SAVED_DIR}/map_${gameId}.txt for the generated map data.`
+    );
   } catch (error) {
     console.error("❌ Error:", error.message);
     if (error.message.includes("ENOENT") && error.message.includes("reveal_")) {
       console.log(
-        "💡 Make sure reveal_<gameId>.txt exists (run commit.js first)"
+        `💡 Make sure ${SAVED_DIR}/reveal_<gameId>.txt exists (run commit.js first)`
       );
     }
     process.exit(1);
