@@ -15,6 +15,7 @@ GAME CONSTRAINTS
 - Each player can mine a maximum of 3 times per game
 - Players accumulate score by mining on different land types
 - Once moves or mines are exhausted, players cannot perform those actions
+- Games have a 90-second timer - when time expires, all players' moves and mines are set to 0
 
 SCORING SYSTEM
 --------------
@@ -41,13 +42,22 @@ MOVEMENT DIRECTIONS
 ------------------
 Valid directions: north, south, east, west, northeast, northwest, southeast, southwest
 
+TIMER MECHANICS
+---------------
+- Each game has a 90-second timer that starts when the game server initializes
+- Timer information is included in most API responses as "timeRemaining" (seconds)
+- Players receive warnings in server logs at 60, 30, 10, and 5 seconds remaining
+- When timer expires, all players' moves and mines are automatically set to 0
+- Game immediately ends and proceeds to payout phase
+- Players cannot move or mine once timer expires - API returns "Time expired! Game over."
+
 API ENDPOINTS
 =============
 
 AUTHENTICATION ENDPOINTS
 ------------------------
 
-1. GET /register
+5. GET /register
 ----------------
 Get the message that needs to be signed for authentication.
 
@@ -59,7 +69,7 @@ Response:
   "instructions": "Sign this message with your Ethereum wallet to authenticate"
 }
 
-2. POST /register
+6. POST /register
 -----------------
 Submit the signature to get a JWT token.
 
@@ -86,19 +96,71 @@ Response (Error):
 PUBLIC ENDPOINTS
 ----------------
 
-3. GET /status
---------------
-Get overall game status and server info.
+1. GET /
+--------
+Get basic server information and current game status.
 
 Response:
 {
   "success": true,
+  "message": "Automated Game Server",
+  "version": "2.0.0",
+  "gameId": "12345",
+  "activeGames": ["12345"],
+  "serverStatus": "running",
+  "timestamp": "2025-06-29T11:55:03.109Z",
+  "timer": {
+    "active": true,
+    "duration": 90,
+    "timeRemaining": 73
+  },
+  "endpoints": {
+    "register": "/register",
+    "map": "/map (requires auth)",
+    "move": "/move (requires auth)",
+    "mine": "/mine (requires auth)",
+    "status": "/status",
+    "players": "/players",
+    "test": "/test"
+  }
+}
+
+2. GET /test
+------------
+Simple test endpoint to verify server is running.
+
+Response:
+{
+  "success": true,
+  "message": "Server is running!",
+  "gameId": "12345",
+  "timestamp": "2025-06-29T11:55:03.109Z",
+  "gameLoaded": true,
+  "playersCount": 2
+}
+
+3. GET /status
+--------------
+Get overall game status and server info, including timer information.
+
+Response:
+{
+  "success": true,
+  "gameId": "12345",
+  "activeGames": ["12345"],
   "gameLoaded": true,
   "mapSize": 20,
   "totalPlayers": 2,
   "players": ["0x05937Df8ca0636505d92Fd769d303A3D461587ed", "0x1a39C55e6333025A3Be3768873C846632ACDb6f5"],
   "revealSeed": "0x5d1fea4f13119a5c07e66d501706ea199ab91c3b1a0da9b7f087e22cd675524c",
-  "serverTime": "2025-06-29T11:55:03.109Z"
+  "serverTime": "2025-06-29T11:55:03.109Z",
+  "timer": {
+    "active": true,
+    "duration": 90,
+    "timeRemaining": 73,
+    "timeElapsed": 17,
+    "startTime": 1719657603109
+  }
 }
 
 
@@ -106,7 +168,7 @@ Response:
 PROTECTED ENDPOINTS (Require JWT Token)
 ---------------------------------------
 
-5. GET /map
+7. GET /map
 -----------
 Get the 3x3 local map view for the authenticated player plus current stats.
 
@@ -141,6 +203,7 @@ Response:
   "score": 15,
   "movesRemaining": 8,
   "minesRemaining": 1,
+  "timeRemaining": 73,
   "legend": {
     "0": "Depleted (already mined)",
     "1": "Common (1 point)",
@@ -155,7 +218,7 @@ Notes:
 - "player": true marks the player's current position
 - coordinates show the actual map coordinates for each tile
 
-6. POST /move
+8. POST /move
 -------------
 Move the authenticated player in a specified direction.
 
@@ -197,6 +260,7 @@ Response:
   "score": 15,
   "movesRemaining": 7,
   "minesRemaining": 1,
+  "timeRemaining": 68,
   "validDirections": ["north", "south", "east", "west", "northeast", "northwest", "southeast", "southwest"]
 }
 
@@ -210,7 +274,7 @@ Error Response (invalid direction):
   "error": "Invalid direction"
 }
 
-7. POST /mine
+9. POST /mine
 -------------
 Mine at the authenticated player's current position to earn points.
 
@@ -232,6 +296,7 @@ Response:
   "totalScore": 20,
   "movesRemaining": 7,
   "minesRemaining": 0,
+  "timeRemaining": 65,
   "localView": [
     [
       {"tile": 1, "player": false, "coordinates": {"x": 16, "y": 2}},
@@ -261,13 +326,14 @@ Error Response (tile already mined):
   "error": "Tile already mined"
 }
 
-4. GET /players
+10. GET /players
 ---------------
 Get all player positions, current tiles, and game stats.
 
 Response:
 {
   "success": true,
+  "gameId": "12345",
   "players": [
     {
       "address": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
@@ -286,7 +352,40 @@ Response:
       "minesRemaining": 3
     }
   ],
-  "count": 2
+  "count": 2,
+  "timeRemaining": 58
+}
+
+ADMIN ENDPOINTS
+---------------
+
+11. POST /admin/finish
+----------------------
+Force finish the current game (for debugging purposes).
+
+Request Body: (empty)
+{}
+
+Response:
+{
+  "success": true,
+  "message": "Game finished manually",
+  "gameId": "12345",
+  "players": [
+    {
+      "address": "0x05937Df8ca0636505d92Fd769d303A3D461587ed",
+      "position": {"x": 18, "y": 3},
+      "tile": 2,
+      "score": 15,
+      "movesRemaining": 8,
+      "minesRemaining": 1
+    }
+  ]
+}
+
+Error Response (no active game):
+{
+  "error": "No active game"
 }
 
 GAME MECHANICS
@@ -297,7 +396,10 @@ GAME MECHANICS
 - Players can mine their current tile for points (3 mines max)
 - After mining, tiles become depleted (value 0) and cannot be mined again
 - No collision detection between players
-- Game ends when player exhausts moves and mines
+- 90-second timer starts when game server initializes
+- Timer warnings logged at 60, 30, 10, and 5 seconds remaining
+- When timer expires, all players' moves and mines are set to 0
+- Game ends when player exhausts moves and mines OR timer expires
 
 ERROR HANDLING
 ==============
@@ -305,11 +407,13 @@ Movement Errors:
 - No moves remaining: {"error": "No moves remaining"}
 - Invalid direction: {"error": "Invalid direction"}
 - Player not found: {"error": "Player not found"} (404 status)
+- Timer expired: {"error": "Time expired! Game over."} (400 status)
 
 Mining Errors:
 - No mines remaining: {"error": "No mines remaining"}
 - Tile already mined: {"error": "Tile already mined"}
 - Player not found: {"error": "Player not found"} (404 status)
+- Timer expired: {"error": "Time expired! Game over."} (400 status)
 
 Authentication Errors:
 - Missing token: {"error": "Access token required"} (401 status)
@@ -318,15 +422,16 @@ Authentication Errors:
 
 SAMPLE CLIENT FLOW
 ==================
-1. GET /status - Check if game is loaded
+1. GET /status - Check if game is loaded and see timer status
 2. GET /register - Get the message to sign
 3. Sign the message with your Ethereum wallet (e.g., MetaMask)
 4. POST /register - Submit signature to get JWT token
 5. GET /map - Get initial position and local view (with Authorization header)
-6. POST /move - Make strategic moves based on what you see (max 12)
-7. POST /mine - Mine valuable tiles for points (max 3 times)
-8. Repeat steps 6-7 until moves/mines exhausted
-9. GET /players - Check final scores and rankings
+6. Monitor timeRemaining in all API responses to track time left
+7. POST /move - Make strategic moves based on what you see (max 12)
+8. POST /mine - Mine valuable tiles for points (max 3 times)
+9. Repeat steps 7-8 until moves/mines exhausted OR timer expires
+10. GET /players - Check final scores and rankings
 
 STRATEGY TIPS
 =============
@@ -336,6 +441,10 @@ STRATEGY TIPS
 - Common tiles (1 point) may not be worth mining unless you're sure
 - Avoid mining tiles that are already depleted (value 0) - they give no points
 - Coordinate with other players to avoid mining the same valuable tiles
+- Work fast! You only have 90 seconds before the timer expires
+- Monitor timeRemaining in API responses to track how much time is left
+- Consider nearby tiles over distant exploration when time is running low
+- Mine valuable tiles immediately when found - don't wait for "perfect" strategy
 
 AUTHENTICATION HEADERS
 ======================
@@ -345,4 +454,5 @@ Authorization: Bearer <your_jwt_token>
 Example with curl:
 curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." http://localhost:8000/map
 
-All responses include "success": true on successful operations. 
+All responses include "success": true on successful operations.
+

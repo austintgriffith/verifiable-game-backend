@@ -873,6 +873,14 @@ async function stopGameServer() {
     httpsServer.close();
     httpsServer = null;
   }
+
+  // Clear game timer
+  if (gameTimerInterval) {
+    clearTimeout(gameTimerInterval);
+    gameTimerInterval = null;
+  }
+  gameStartTime = null;
+
   if (activeGameServer) {
     log(`Game server stopped for game ${activeGameServer}`, activeGameServer);
     activeGameServer = null;
@@ -886,6 +894,21 @@ async function monitorGameProgress(gameId) {
     if (activeGameServer !== gameId) {
       log(`⚠️ Cannot monitor - server not running for this game`, gameId);
       return;
+    }
+
+    // Check if timer has expired
+    const timeRemaining = getTimeRemaining();
+    if (timeRemaining <= 0 && gameStartTime !== null) {
+      log(`⏰ Timer expired! Force finishing game...`, gameId);
+      forceFinishGameOnTimer(gameId);
+    } else if (gameStartTime !== null) {
+      // Log timer warnings at key intervals
+      const warningTimes = [60, 30, 10, 5];
+      const currentTime = Math.floor(timeRemaining);
+
+      if (warningTimes.includes(currentTime)) {
+        log(`⏰ Timer warning: ${currentTime} seconds remaining!`, gameId);
+      }
     }
 
     // Check if all players have finished
@@ -917,6 +940,12 @@ async function monitorGameProgress(gameId) {
       });
 
       saveGameScores(gameId, playerData);
+
+      // Clear the timer since game is finished
+      if (gameTimerInterval) {
+        clearInterval(gameTimerInterval);
+        gameTimerInterval = null;
+      }
 
       // Keep server running for now - will stop it later after payout/reveal
       log(`🌐 Keeping game server running for payout/reveal phase...`, gameId);
@@ -1101,6 +1130,11 @@ let playerPositions = new Map();
 let playerStats = new Map();
 let revealSeed = null;
 
+// Timer state
+let gameStartTime = null;
+let gameTimerDuration = 90; // 90 seconds
+let gameTimerInterval = null;
+
 // Game constants
 const MAX_MOVES = 12;
 const MAX_MINES = 3;
@@ -1173,6 +1207,50 @@ function getCurrentPlayerData(gameId) {
     }
   });
   return playerData;
+}
+
+function getTimeRemaining() {
+  if (!gameStartTime) return 0;
+  const elapsed = Math.floor((Date.now() - gameStartTime) / 1000);
+  return Math.max(0, gameTimerDuration - elapsed);
+}
+
+function forceFinishGameOnTimer(gameId) {
+  log(`⏰ Timer expired! Force finishing game ${gameId}...`, gameId);
+
+  // Log current player stats before forcing finish
+  const playerData = getCurrentPlayerData(gameId);
+  log(`📊 Game ending due to timer - Current player stats:`, gameId);
+  playerData.forEach((player, index) => {
+    log(`  Player ${index + 1}: ${player.address}`, gameId);
+    log(
+      `    Score: ${player.score}, Moves: ${player.movesRemaining}, Mines: ${player.minesRemaining}`,
+      gameId
+    );
+  });
+
+  // Set all players' moves and mines to 0
+  players.forEach((address) => {
+    const stats = playerStats.get(address.toLowerCase());
+    if (stats) {
+      stats.movesRemaining = 0;
+      stats.minesRemaining = 0;
+      playerStats.set(address.toLowerCase(), stats);
+    }
+  });
+
+  log(
+    `🏁 All players' moves and mines set to 0 due to timer expiration`,
+    gameId
+  );
+
+  // Clear the timer
+  if (gameTimerInterval) {
+    clearTimeout(gameTimerInterval);
+    gameTimerInterval = null;
+  }
+
+  // The game will be detected as finished in the next monitoring cycle
 }
 
 async function loadPlayersFromContract(gameId) {
@@ -1336,6 +1414,9 @@ function minePlayer(playerAddress) {
 
 // API Routes
 app.get("/", (req, res) => {
+  const timeRemaining = getTimeRemaining();
+  const gameActive = gameStartTime !== null;
+
   res.json({
     success: true,
     message: "Automated Game Server",
@@ -1344,6 +1425,11 @@ app.get("/", (req, res) => {
     activeGames: Array.from(gameStates.keys()),
     serverStatus: "running",
     timestamp: new Date().toISOString(),
+    timer: {
+      active: gameActive,
+      duration: gameTimerDuration,
+      timeRemaining: timeRemaining,
+    },
     endpoints: {
       register: "/register",
       map: "/map (requires auth)",
@@ -1468,6 +1554,7 @@ app.get("/map", authenticateToken, (req, res) => {
   }
 
   const stats = playerStats.get(req.playerAddress.toLowerCase());
+  const timeRemaining = getTimeRemaining();
 
   res.json({
     success: true,
@@ -1478,6 +1565,7 @@ app.get("/map", authenticateToken, (req, res) => {
     score: stats ? stats.score : 0,
     movesRemaining: stats ? stats.movesRemaining : 0,
     minesRemaining: stats ? stats.minesRemaining : 0,
+    timeRemaining: timeRemaining,
     legend: {
       0: "Depleted (already mined)",
       1: "Common (1 point)",
@@ -1492,6 +1580,11 @@ app.post("/move", authenticateToken, (req, res) => {
   const { direction } = req.body;
   if (!direction) {
     return res.status(400).json({ error: "Direction required" });
+  }
+
+  const timeRemaining = getTimeRemaining();
+  if (timeRemaining <= 0) {
+    return res.status(400).json({ error: "Time expired! Game over." });
   }
 
   const moveResult = movePlayer(req.playerAddress, direction);
@@ -1511,11 +1604,17 @@ app.post("/move", authenticateToken, (req, res) => {
     score: moveResult.score,
     movesRemaining: moveResult.movesRemaining,
     minesRemaining: moveResult.minesRemaining,
+    timeRemaining: timeRemaining,
     validDirections: Object.keys(DIRECTIONS),
   });
 });
 
 app.post("/mine", authenticateToken, (req, res) => {
+  const timeRemaining = getTimeRemaining();
+  if (timeRemaining <= 0) {
+    return res.status(400).json({ error: "Time expired! Game over." });
+  }
+
   const mineResult = minePlayer(req.playerAddress);
   if (!mineResult.success) {
     return res.status(400).json({ error: mineResult.error });
@@ -1532,11 +1631,15 @@ app.post("/mine", authenticateToken, (req, res) => {
     totalScore: mineResult.totalScore,
     movesRemaining: mineResult.movesRemaining,
     minesRemaining: mineResult.minesRemaining,
+    timeRemaining: timeRemaining,
     localView: localView.view,
   });
 });
 
 app.get("/status", (req, res) => {
+  const timeRemaining = getTimeRemaining();
+  const gameActive = gameStartTime !== null;
+
   res.json({
     success: true,
     gameId: currentGameId,
@@ -1547,16 +1650,26 @@ app.get("/status", (req, res) => {
     players,
     revealSeed,
     serverTime: new Date().toISOString(),
+    timer: {
+      active: gameActive,
+      duration: gameTimerDuration,
+      timeRemaining: timeRemaining,
+      timeElapsed: gameActive ? gameTimerDuration - timeRemaining : 0,
+      startTime: gameStartTime,
+    },
   });
 });
 
 app.get("/players", (req, res) => {
   const playerData = getCurrentPlayerData(currentGameId);
+  const timeRemaining = getTimeRemaining();
+
   res.json({
     success: true,
     gameId: currentGameId,
     players: playerData,
     count: playerData.length,
+    timeRemaining: timeRemaining,
   });
 });
 
@@ -1581,6 +1694,21 @@ async function initializeGameServer(gameId) {
       return false;
     }
     log(`✅ Loaded ${players.length} players`, gameId);
+
+    // Start the game timer
+    gameStartTime = Date.now();
+    log(
+      `⏰ Game timer started - players have ${gameTimerDuration} seconds`,
+      gameId
+    );
+
+    // Set up timer to force finish game after duration
+    gameTimerInterval = setTimeout(() => {
+      if (activeGameServer === gameId) {
+        log(`⏰ Timer expired! Auto-finishing game ${gameId}`, gameId);
+        forceFinishGameOnTimer(gameId);
+      }
+    }, gameTimerDuration * 1000);
 
     // Start server
     const PORT = 8000;
