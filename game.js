@@ -1483,7 +1483,7 @@ app.get("/map", authenticateToken, (req, res) => {
       1: "Common (1 point)",
       2: "Uncommon (5 points)",
       3: "Rare (10 points)",
-      X: "Starting position (25 points)",
+      X: "Treasure!!! (25 points)",
     },
   });
 });
