@@ -47,6 +47,8 @@ let httpsServer = null;
 let lastWaitingLogs = new Map(); // Map of gameId -> timestamp of last waiting log
 let payoutRetryCount = new Map(); // Map of gameId -> retry count
 let payoutLastRetryTime = new Map(); // Map of gameId -> timestamp of last retry
+let revealRetryCount = new Map(); // Map of gameId -> retry count for reveal
+let revealLastRetryTime = new Map(); // Map of gameId -> timestamp of last reveal retry
 let globalAccount = null;
 let globalPublicClient = null;
 let globalWalletClient = null;
@@ -551,6 +553,41 @@ async function revealGame(gameId) {
       return true;
     }
 
+    // Check retry logic
+    const retryCount = revealRetryCount.get(gameId) || 0;
+    const lastRetryTime = revealLastRetryTime.get(gameId) || 0;
+    const now = Date.now();
+    const MAX_RETRIES = 5;
+    const RETRY_BACKOFF_MS = Math.min(30000 * Math.pow(2, retryCount), 300000); // 30s to 5 minutes
+
+    if (retryCount >= MAX_RETRIES) {
+      log(`❌ Reveal failed after ${MAX_RETRIES} retries - giving up`, gameId);
+      log(`💡 Blockhash likely too old, skipping reveal for this game`, gameId);
+
+      // Move to complete phase anyway to prevent infinite loop
+      log(`⚠️ Marking game as complete despite reveal failure`, gameId);
+
+      // Clean up retry tracking
+      revealRetryCount.delete(gameId);
+      revealLastRetryTime.delete(gameId);
+
+      // Update game state to indicate reveal was skipped
+      const gameState = gameStates.get(gameId);
+      if (gameState) {
+        gameState.revealSkipped = true;
+        gameState.phase = GamePhase.COMPLETE;
+        gameStates.set(gameId, gameState);
+      }
+
+      return true; // Return true to move to complete phase
+    }
+
+    // Check if we should wait before retrying
+    if (retryCount > 0 && now - lastRetryTime < RETRY_BACKOFF_MS) {
+      // Still in backoff period, don't retry yet
+      return false;
+    }
+
     // Load reveal value
     const revealValue = loadRevealValue(gameId);
 
@@ -573,6 +610,10 @@ async function revealGame(gameId) {
     if (receipt.status === "success") {
       log(`Reveal successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
 
+      // Clear retry tracking on success
+      revealRetryCount.delete(gameId);
+      revealLastRetryTime.delete(gameId);
+
       // Get final state to show random hash
       const finalState = await globalPublicClient.readContract({
         address: globalContractAddress,
@@ -586,11 +627,46 @@ async function revealGame(gameId) {
 
       return true;
     } else {
-      log(`Reveal failed!`, gameId);
+      log(
+        `❌ Reveal transaction failed with status: ${receipt.status}`,
+        gameId
+      );
+
+      // Increment retry count
+      revealRetryCount.set(gameId, retryCount + 1);
+      revealLastRetryTime.set(gameId, now);
+
       return false;
     }
   } catch (error) {
-    log(`Error in reveal phase: ${error.message}`, gameId);
+    const retryCount = revealRetryCount.get(gameId) || 0;
+    const now = Date.now();
+
+    // Check if this is a "blockhash not available" error
+    if (error.message.includes("Blockhash not available")) {
+      log(
+        `📅 Blockhash too old for reveal (attempt ${retryCount + 1}/${5})`,
+        gameId
+      );
+      log(
+        `💡 This happens when too much time passes between commit and reveal`,
+        gameId
+      );
+
+      // Use longer backoff for blockhash errors since they're unlikely to resolve quickly
+      const BACKOFF_MS = Math.min(60000 * Math.pow(2, retryCount), 600000); // 1 minute to 10 minutes
+      log(
+        `⏳ Will retry in ${Math.round(BACKOFF_MS / 1000)} seconds...`,
+        gameId
+      );
+    } else {
+      log(`❌ Error in reveal phase: ${error.message}`, gameId);
+    }
+
+    // Increment retry count
+    revealRetryCount.set(gameId, retryCount + 1);
+    revealLastRetryTime.set(gameId, now);
+
     return false;
   }
 }
@@ -897,9 +973,56 @@ async function processGamePhase(gameId) {
         log(`⚠️ Note: Payout was skipped due to insufficient funds`, gameId);
         log(`💡 Winners were not paid out on-chain`, gameId);
       }
-      log(`🎯 Action needed: Reveal hash`, gameId);
+
+      const currentRevealRetryCount = revealRetryCount.get(gameId) || 0;
+      const currentRevealLastRetryTime = revealLastRetryTime.get(gameId) || 0;
+      const currentTime = Date.now();
+
+      if (currentRevealRetryCount > 0) {
+        const RETRY_BACKOFF_MS = Math.min(
+          30000 * Math.pow(2, currentRevealRetryCount - 1),
+          300000
+        );
+        const timeUntilRetry = Math.max(
+          0,
+          RETRY_BACKOFF_MS - (currentTime - currentRevealLastRetryTime)
+        );
+
+        if (timeUntilRetry > 0) {
+          // Still in backoff period
+          if (shouldLogThisCycle) {
+            log(
+              `⏳ Reveal retry ${currentRevealRetryCount}/5 in ${Math.round(
+                timeUntilRetry / 1000
+              )}s (blockhash too old)`,
+              gameId
+            );
+          }
+          break;
+        }
+      }
+
+      log(
+        `🎯 Action needed: Reveal hash${
+          currentRevealRetryCount > 0
+            ? ` (retry ${currentRevealRetryCount + 1}/5)`
+            : ""
+        }`,
+        gameId
+      );
       const revealSuccess = await revealGame(gameId);
       if (revealSuccess) {
+        const gameState = gameStates.get(gameId);
+        if (gameState && gameState.revealSkipped) {
+          log(
+            `⚠️ Note: Reveal was skipped due to blockhash being too old`,
+            gameId
+          );
+          log(
+            `💡 Game is complete but random hash was not revealed on-chain`,
+            gameId
+          );
+        }
         log(`✅ Reveal phase completed`, gameId);
 
         // Schedule delayed shutdown of game server to give frontend time to finish
@@ -919,7 +1042,10 @@ async function processGamePhase(gameId) {
           }
         }, 10000); // 10 second delay
       } else {
-        log(`❌ Reveal phase failed`, gameId);
+        const newRetryCount = revealRetryCount.get(gameId) || 0;
+        if (newRetryCount < 5) {
+          log(`❌ Reveal phase failed (will retry)`, gameId);
+        }
       }
       break;
 
@@ -936,6 +1062,8 @@ async function processGamePhase(gameId) {
       // Clean up retry tracking data
       payoutRetryCount.delete(gameId);
       payoutLastRetryTime.delete(gameId);
+      revealRetryCount.delete(gameId);
+      revealLastRetryTime.delete(gameId);
       // Clean up timer warning keys for this game
       const keysToDelete = [];
       for (const [key, value] of lastWaitingLogs.entries()) {
@@ -1105,6 +1233,12 @@ async function stopGameServer() {
     }
   }
   keysToDelete.forEach((key) => lastWaitingLogs.delete(key));
+
+  // Clean up any retry tracking for the current game
+  if (activeGameServer) {
+    revealRetryCount.delete(activeGameServer);
+    revealLastRetryTime.delete(activeGameServer);
+  }
 
   if (activeGameServer) {
     log(`Game server stopped for game ${activeGameServer}`, activeGameServer);
@@ -2148,8 +2282,25 @@ app.get("/status", (req, res) => {
     const timeUntilRetry = Math.max(0, backoffMs - (now - lastRetry));
 
     retryInfo[gameId] = {
+      type: "payout",
       retryCount: count,
       maxRetries: 10,
+      timeUntilRetry: Math.round(timeUntilRetry / 1000),
+      lastRetryTime: new Date(lastRetry).toISOString(),
+    };
+  }
+
+  // Add reveal retry information
+  for (const [gameId, count] of revealRetryCount.entries()) {
+    const lastRetry = revealLastRetryTime.get(gameId) || 0;
+    const now = Date.now();
+    const backoffMs = Math.min(30000 * Math.pow(2, count - 1), 300000);
+    const timeUntilRetry = Math.max(0, backoffMs - (now - lastRetry));
+
+    retryInfo[gameId] = {
+      type: "reveal",
+      retryCount: count,
+      maxRetries: 5,
       timeUntilRetry: Math.round(timeUntilRetry / 1000),
       lastRetryTime: new Date(lastRetry).toISOString(),
     };
