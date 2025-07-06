@@ -1366,7 +1366,7 @@ let gameTimerDuration = 90; // 90 seconds
 let gameTimerInterval = null;
 
 // Debug flag - SET TO FALSE TO DISABLE HEAVY DEBUGGING
-const heavyDebug = true; // Set to false to disable heavy debugging
+const heavyDebug = false; // Set to false to disable heavy debugging
 // This will log detailed information about player positions, movements, and API responses
 
 // Game constants
