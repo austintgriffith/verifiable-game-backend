@@ -1365,6 +1365,10 @@ let gameStartTime = null;
 let gameTimerDuration = 90; // 90 seconds
 let gameTimerInterval = null;
 
+// Debug flag - SET TO FALSE TO DISABLE HEAVY DEBUGGING
+const heavyDebug = true; // Set to false to disable heavy debugging
+// This will log detailed information about player positions, movements, and API responses
+
 // Game constants
 const MAP_MULTIPLIER = 4;
 const MAX_MOVES = 12;
@@ -1419,7 +1423,16 @@ function getCurrentMapSize() {
 
 function wrapCoordinate(coord, mapSize = null) {
   const size = mapSize || getCurrentMapSize();
-  return ((coord % size) + size) % size;
+  const result = ((coord % size) + size) % size;
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] wrapCoordinate: coord=${coord}, size=${size}, result=${result}`,
+      currentGameId
+    );
+  }
+
+  return result;
 }
 
 function generateStartingPosition(playerAddress, gameId) {
@@ -1430,6 +1443,20 @@ function generateStartingPosition(playerAddress, gameId) {
   const mapSize = getCurrentMapSize();
   const x = parseInt(xHex, 16) % mapSize;
   const y = parseInt(yHex, 16) % mapSize;
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] generateStartingPosition for ${playerAddress}: combined=${combined.substring(
+        0,
+        20
+      )}..., hash=${hash.substring(
+        0,
+        20
+      )}..., xHex=${xHex}, yHex=${yHex}, mapSize=${mapSize}, result={x:${x}, y:${y}}`,
+      gameId
+    );
+  }
+
   return { x, y };
 }
 
@@ -1521,6 +1548,15 @@ async function loadPlayersFromContract(gameId) {
       args: [BigInt(gameId)],
     });
 
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] loadPlayersFromContract: Found ${
+          contractPlayers.length
+        } players: ${JSON.stringify(contractPlayers)}`,
+        gameId
+      );
+    }
+
     players = contractPlayers;
     playerPositions.clear();
     playerStats.clear();
@@ -1533,7 +1569,31 @@ async function loadPlayersFromContract(gameId) {
         movesRemaining: MAX_MOVES,
         minesRemaining: MAX_MINES,
       });
+
+      if (heavyDebug) {
+        log(
+          `🔍 [DEBUG] loadPlayersFromContract: Set ${playerAddress} at position ${JSON.stringify(
+            startPos
+          )} with stats {score:0, moves:${MAX_MOVES}, mines:${MAX_MINES}}`,
+          gameId
+        );
+      }
     });
+
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] loadPlayersFromContract: Final playerPositions map: ${JSON.stringify(
+          Object.fromEntries(playerPositions)
+        )}`,
+        gameId
+      );
+      log(
+        `🔍 [DEBUG] loadPlayersFromContract: Final playerStats map: ${JSON.stringify(
+          Object.fromEntries(playerStats)
+        )}`,
+        gameId
+      );
+    }
 
     log(`Loaded ${contractPlayers.length} players from contract`, gameId);
     return true;
@@ -1583,10 +1643,26 @@ function authenticateToken(req, res, next) {
     }
 
     if (!isValidPlayer(decoded.address)) {
+      if (heavyDebug) {
+        log(
+          `🔍 [DEBUG] authenticateToken: Player ${
+            decoded.address
+          } is not valid. Current players: ${JSON.stringify(players)}`,
+          currentGameId
+        );
+      }
       return res.status(403).json({ error: "Player no longer registered" });
     }
 
     req.playerAddress = decoded.address;
+
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] authenticateToken: Authenticated player ${decoded.address}`,
+        currentGameId
+      );
+    }
+
     next();
   });
 }
@@ -1594,7 +1670,24 @@ function authenticateToken(req, res, next) {
 // Game logic functions
 function getLocalMapView(playerAddress) {
   const position = playerPositions.get(playerAddress.toLowerCase());
-  if (!position) return null;
+  if (!position) {
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] getLocalMapView: No position found for ${playerAddress}`,
+        currentGameId
+      );
+    }
+    return null;
+  }
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] getLocalMapView for ${playerAddress}: position=${JSON.stringify(
+        position
+      )}, mapSize=${gameMap.size}`,
+      currentGameId
+    );
+  }
 
   const localView = [];
   const { x: centerX, y: centerY } = position;
@@ -1615,15 +1708,49 @@ function getLocalMapView(playerAddress) {
     localView.push(row);
   }
 
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] getLocalMapView result: localView=${JSON.stringify(
+        localView
+      )}, position=${JSON.stringify(position)}, mapSize=${gameMap.size}`,
+      currentGameId
+    );
+  }
+
   return { view: localView, position, mapSize: gameMap.size };
 }
 
 function movePlayer(playerAddress, direction) {
   const currentPos = playerPositions.get(playerAddress.toLowerCase());
-  if (!currentPos) return { success: false, error: "Player not found" };
+  if (!currentPos) {
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] movePlayer: No position found for ${playerAddress}`,
+        currentGameId
+      );
+    }
+    return { success: false, error: "Player not found" };
+  }
 
   const stats = playerStats.get(playerAddress.toLowerCase());
-  if (!stats) return { success: false, error: "Player stats not found" };
+  if (!stats) {
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] movePlayer: No stats found for ${playerAddress}`,
+        currentGameId
+      );
+    }
+    return { success: false, error: "Player stats not found" };
+  }
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] movePlayer for ${playerAddress}: direction=${direction}, currentPos=${JSON.stringify(
+        currentPos
+      )}, stats=${JSON.stringify(stats)}`,
+      currentGameId
+    );
+  }
 
   if (stats.movesRemaining <= 0)
     return { success: false, error: "No moves remaining" };
@@ -1634,11 +1761,20 @@ function movePlayer(playerAddress, direction) {
   const newX = wrapCoordinate(currentPos.x + dirVector.x, gameMap.size);
   const newY = wrapCoordinate(currentPos.y + dirVector.y, gameMap.size);
 
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] movePlayer calculation: dirVector=${JSON.stringify(
+        dirVector
+      )}, newX=${newX}, newY=${newY}, mapSize=${gameMap.size}`,
+      currentGameId
+    );
+  }
+
   playerPositions.set(playerAddress.toLowerCase(), { x: newX, y: newY });
   stats.movesRemaining--;
   playerStats.set(playerAddress.toLowerCase(), stats);
 
-  return {
+  const result = {
     success: true,
     newPosition: { x: newX, y: newY },
     tile: gameMap.land[newY][newX],
@@ -1646,14 +1782,48 @@ function movePlayer(playerAddress, direction) {
     minesRemaining: stats.minesRemaining,
     score: stats.score,
   };
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] movePlayer result: ${JSON.stringify(result)}`,
+      currentGameId
+    );
+  }
+
+  return result;
 }
 
 function minePlayer(playerAddress) {
   const currentPos = playerPositions.get(playerAddress.toLowerCase());
-  if (!currentPos) return { success: false, error: "Player not found" };
+  if (!currentPos) {
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] minePlayer: No position found for ${playerAddress}`,
+        currentGameId
+      );
+    }
+    return { success: false, error: "Player not found" };
+  }
 
   const stats = playerStats.get(playerAddress.toLowerCase());
-  if (!stats) return { success: false, error: "Player stats not found" };
+  if (!stats) {
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] minePlayer: No stats found for ${playerAddress}`,
+        currentGameId
+      );
+    }
+    return { success: false, error: "Player stats not found" };
+  }
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] minePlayer for ${playerAddress}: currentPos=${JSON.stringify(
+        currentPos
+      )}, stats=${JSON.stringify(stats)}`,
+      currentGameId
+    );
+  }
 
   if (stats.minesRemaining <= 0)
     return { success: false, error: "No mines remaining" };
@@ -1668,7 +1838,7 @@ function minePlayer(playerAddress) {
 
   gameMap.land[currentPos.y][currentPos.x] = 0;
 
-  return {
+  const result = {
     success: true,
     position: currentPos,
     tile: currentTile,
@@ -1677,6 +1847,15 @@ function minePlayer(playerAddress) {
     minesRemaining: stats.minesRemaining,
     movesRemaining: stats.movesRemaining,
   };
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] minePlayer result: ${JSON.stringify(result)}`,
+      currentGameId
+    );
+  }
+
+  return result;
 }
 
 // API Routes
@@ -1787,15 +1966,37 @@ app.post("/register", async (req, res) => {
 });
 
 app.get("/map", authenticateToken, (req, res) => {
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] /map endpoint called by ${req.playerAddress}`,
+      currentGameId
+    );
+  }
+
   const localView = getLocalMapView(req.playerAddress);
   if (!localView) {
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] /map: localView is null for ${req.playerAddress}`,
+        currentGameId
+      );
+    }
     return res.status(404).json({ error: "Player not found" });
   }
 
   const stats = playerStats.get(req.playerAddress.toLowerCase());
   const timeRemaining = getTimeRemaining();
 
-  res.json({
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] /map: stats=${JSON.stringify(
+        stats
+      )}, timeRemaining=${timeRemaining}`,
+      currentGameId
+    );
+  }
+
+  const response = {
     success: true,
     player: req.playerAddress,
     localView: localView.view,
@@ -1812,13 +2013,31 @@ app.get("/map", authenticateToken, (req, res) => {
       3: "Rare (10 points)",
       X: "Treasure!!! (25 points)",
     },
-  });
+  };
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] /map response for ${req.playerAddress}: ${JSON.stringify(
+        response
+      )}`,
+      currentGameId
+    );
+  }
+
+  res.json(response);
 });
 
 app.post("/move", authenticateToken, (req, res) => {
   const { direction } = req.body;
   if (!direction) {
     return res.status(400).json({ error: "Direction required" });
+  }
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] /move endpoint called by ${req.playerAddress}, direction=${direction}`,
+      currentGameId
+    );
   }
 
   const timeRemaining = getTimeRemaining();
@@ -1828,12 +2047,18 @@ app.post("/move", authenticateToken, (req, res) => {
 
   const moveResult = movePlayer(req.playerAddress, direction);
   if (!moveResult.success) {
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] /move: movePlayer failed for ${req.playerAddress}: ${moveResult.error}`,
+        currentGameId
+      );
+    }
     return res.status(400).json({ error: moveResult.error });
   }
 
   const localView = getLocalMapView(req.playerAddress);
 
-  res.json({
+  const response = {
     success: true,
     player: req.playerAddress,
     direction,
@@ -1845,10 +2070,28 @@ app.post("/move", authenticateToken, (req, res) => {
     minesRemaining: moveResult.minesRemaining,
     timeRemaining: timeRemaining,
     validDirections: Object.keys(DIRECTIONS),
-  });
+  };
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] /move response for ${req.playerAddress}: ${JSON.stringify(
+        response
+      )}`,
+      currentGameId
+    );
+  }
+
+  res.json(response);
 });
 
 app.post("/mine", authenticateToken, (req, res) => {
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] /mine endpoint called by ${req.playerAddress}`,
+      currentGameId
+    );
+  }
+
   const timeRemaining = getTimeRemaining();
   if (timeRemaining <= 0) {
     return res.status(400).json({ error: "Time expired! Game over." });
@@ -1856,12 +2099,18 @@ app.post("/mine", authenticateToken, (req, res) => {
 
   const mineResult = minePlayer(req.playerAddress);
   if (!mineResult.success) {
+    if (heavyDebug) {
+      log(
+        `🔍 [DEBUG] /mine: minePlayer failed for ${req.playerAddress}: ${mineResult.error}`,
+        currentGameId
+      );
+    }
     return res.status(400).json({ error: mineResult.error });
   }
 
   const localView = getLocalMapView(req.playerAddress);
 
-  res.json({
+  const response = {
     success: true,
     player: req.playerAddress,
     position: mineResult.position,
@@ -1872,7 +2121,18 @@ app.post("/mine", authenticateToken, (req, res) => {
     minesRemaining: mineResult.minesRemaining,
     timeRemaining: timeRemaining,
     localView: localView.view,
-  });
+  };
+
+  if (heavyDebug) {
+    log(
+      `🔍 [DEBUG] /mine response for ${req.playerAddress}: ${JSON.stringify(
+        response
+      )}`,
+      currentGameId
+    );
+  }
+
+  res.json(response);
 });
 
 app.get("/status", (req, res) => {
