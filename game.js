@@ -757,8 +757,17 @@ async function updateGameState(gameId) {
       phase = GamePhase.COMMITTED;
     }
 
-    // Update game state
+    // Update game state - but respect local decisions like revealSkipped
     const currentState = gameStates.get(gameId) || {};
+
+    // If we've locally decided to skip steps, don't override those decisions
+    if (currentState.payoutSkipped && phase === GamePhase.GAME_FINISHED) {
+      phase = GamePhase.PAYOUT_COMPLETE;
+    }
+    if (currentState.revealSkipped && phase === GamePhase.PAYOUT_COMPLETE) {
+      phase = GamePhase.COMPLETE;
+    }
+
     gameStates.set(gameId, {
       ...currentState,
       gameId,
