@@ -557,8 +557,8 @@ async function revealGame(gameId) {
     const retryCount = revealRetryCount.get(gameId) || 0;
     const lastRetryTime = revealLastRetryTime.get(gameId) || 0;
     const now = Date.now();
-    const MAX_RETRIES = 5;
-    const RETRY_BACKOFF_MS = Math.min(30000 * Math.pow(2, retryCount), 300000); // 30s to 5 minutes
+    const MAX_RETRIES = 1; // Give up immediately since blockhash errors never resolve
+    const RETRY_BACKOFF_MS = 10000; // Short 10 second wait before giving up
 
     if (retryCount >= MAX_RETRIES) {
       log(`❌ Reveal failed after ${MAX_RETRIES} retries - giving up`, gameId);
@@ -645,7 +645,9 @@ async function revealGame(gameId) {
     // Check if this is a "blockhash not available" error
     if (error.message.includes("Blockhash not available")) {
       log(
-        `📅 Blockhash too old for reveal (attempt ${retryCount + 1}/${5})`,
+        `📅 Blockhash too old for reveal (attempt ${
+          retryCount + 1
+        }/1 - will give up)`,
         gameId
       );
       log(
@@ -653,8 +655,8 @@ async function revealGame(gameId) {
         gameId
       );
 
-      // Use longer backoff for blockhash errors since they're unlikely to resolve quickly
-      const BACKOFF_MS = Math.min(60000 * Math.pow(2, retryCount), 600000); // 1 minute to 10 minutes
+      // Short backoff before giving up since blockhash errors never resolve
+      const BACKOFF_MS = 10000; // 10 seconds
       log(
         `⏳ Will retry in ${Math.round(BACKOFF_MS / 1000)} seconds...`,
         gameId
@@ -876,7 +878,7 @@ async function processGamePhase(gameId) {
   ) {
     const retryCount = revealRetryCount.get(gameId);
     const lastRetryTime = revealLastRetryTime.get(gameId) || 0;
-    const BACKOFF_MS = Math.min(30000 * Math.pow(2, retryCount - 1), 300000);
+    const BACKOFF_MS = 10000; // Match the 10 second backoff in reveal function
     const timeUntilRetry = Math.max(0, BACKOFF_MS - (now - lastRetryTime));
     inBackoff = timeUntilRetry > 0;
   }
@@ -1008,10 +1010,7 @@ async function processGamePhase(gameId) {
       const currentTime = Date.now();
 
       if (currentRevealRetryCount > 0) {
-        const RETRY_BACKOFF_MS = Math.min(
-          30000 * Math.pow(2, currentRevealRetryCount - 1),
-          300000
-        );
+        const RETRY_BACKOFF_MS = 10000; // Short 10 second wait before giving up
         const timeUntilRetry = Math.max(
           0,
           RETRY_BACKOFF_MS - (currentTime - currentRevealLastRetryTime)
@@ -1022,9 +1021,9 @@ async function processGamePhase(gameId) {
           const retryLogKey = `reveal_retry_${gameId}`;
           if (shouldLogWaitingMessage(retryLogKey)) {
             log(
-              `⏳ Reveal retry ${currentRevealRetryCount}/5 in ${Math.round(
+              `⏳ Final reveal attempt in ${Math.round(
                 timeUntilRetry / 1000
-              )}s (blockhash too old)`,
+              )}s (blockhash too old - will give up after this)`,
               gameId
             );
           }
@@ -1035,7 +1034,7 @@ async function processGamePhase(gameId) {
       log(
         `🎯 Action needed: Reveal hash${
           currentRevealRetryCount > 0
-            ? ` (retry ${currentRevealRetryCount + 1}/5)`
+            ? ` (final attempt - will give up if this fails)`
             : ""
         }`,
         gameId
@@ -1073,7 +1072,7 @@ async function processGamePhase(gameId) {
         }, 10000); // 10 second delay
       } else {
         const newRetryCount = revealRetryCount.get(gameId) || 0;
-        if (newRetryCount < 5) {
+        if (newRetryCount < 1) {
           log(`❌ Reveal phase failed (will retry)`, gameId);
         }
       }
