@@ -5,7 +5,11 @@ import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { createClients, createPublicClientForChain } from "./clients.js";
 import { verifyMessage, keccak256, toBytes, toHex } from "viem";
-import { DeterministicDice, GameLandGenerator } from "./generateMap.js";
+import {
+  DeterministicDice,
+  GameLandGenerator,
+  PlayerPositionGenerator,
+} from "deterministic-map";
 import dotenv from "dotenv";
 
 // Load environment variables
@@ -1615,30 +1619,7 @@ function wrapCoordinate(coord, mapSize = null) {
   return result;
 }
 
-function generateStartingPosition(playerAddress, gameId) {
-  const combined = revealSeed + playerAddress.toLowerCase() + gameId.toString();
-  const hash = crypto.createHash("sha256").update(combined).digest("hex");
-  const xHex = hash.substring(0, 8);
-  const yHex = hash.substring(8, 16);
-  const mapSize = getCurrentMapSize();
-  const x = parseInt(xHex, 16) % mapSize;
-  const y = parseInt(yHex, 16) % mapSize;
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] generateStartingPosition for ${playerAddress}: combined=${combined.substring(
-        0,
-        20
-      )}..., hash=${hash.substring(
-        0,
-        20
-      )}..., xHex=${xHex}, yHex=${yHex}, mapSize=${mapSize}, result={x:${x}, y:${y}}`,
-      gameId
-    );
-  }
-
-  return { x, y };
-}
+// Player positioning now handled by PlayerPositionGenerator from generateMap.js
 
 function getCurrentPlayerData(gameId) {
   const playerData = [];
@@ -1741,8 +1722,16 @@ async function loadPlayersFromContract(gameId) {
     playerPositions.clear();
     playerStats.clear();
 
+    // Generate player positions using the PlayerPositionGenerator
+    const playerPositionGenerator = new PlayerPositionGenerator(revealSeed);
+    const mapSize = getCurrentMapSize();
+
     contractPlayers.forEach((playerAddress) => {
-      const startPos = generateStartingPosition(playerAddress, gameId);
+      const startPos = playerPositionGenerator.generateStartingPosition(
+        playerAddress,
+        gameId,
+        mapSize
+      );
       playerPositions.set(playerAddress.toLowerCase(), startPos);
       playerStats.set(playerAddress.toLowerCase(), {
         score: 0,

@@ -12,12 +12,12 @@
     "reveal": "node reveal.js",
     "open": "node open.js",
     "close": "node close.js",
-    "generate": "node generateMap.js",
     "print": "node print.js",
     "game": "node game.js",
     "payout": "node payout.js"
   },
   "dependencies": {
+    "deterministic-map": "^1.0.0",
     "dotenv": "^16.4.5",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
