@@ -855,13 +855,41 @@ async function processGamePhase(gameId) {
   const shouldLogThisCycle =
     phaseChanged || needsAction || shouldLogWaitingMessage(gameId);
 
-  // Log state if needed
+  // Check if game is in backoff period and should be quiet
+  let inBackoff = false;
+  const now = Date.now();
+
+  if (
+    gameState.phase === GamePhase.GAME_FINISHED &&
+    payoutRetryCount.has(gameId)
+  ) {
+    const retryCount = payoutRetryCount.get(gameId);
+    const lastRetryTime = payoutLastRetryTime.get(gameId) || 0;
+    const BACKOFF_MS = Math.min(5000 * Math.pow(2, retryCount - 1), 300000);
+    const timeUntilRetry = Math.max(0, BACKOFF_MS - (now - lastRetryTime));
+    inBackoff = timeUntilRetry > 0;
+  }
+
+  if (
+    gameState.phase === GamePhase.PAYOUT_COMPLETE &&
+    revealRetryCount.has(gameId)
+  ) {
+    const retryCount = revealRetryCount.get(gameId);
+    const lastRetryTime = revealLastRetryTime.get(gameId) || 0;
+    const BACKOFF_MS = Math.min(30000 * Math.pow(2, retryCount - 1), 300000);
+    const timeUntilRetry = Math.max(0, BACKOFF_MS - (now - lastRetryTime));
+    inBackoff = timeUntilRetry > 0;
+  }
+
+  // Log state if needed (but be quiet during backoff periods unless phase changed)
   if (shouldLogThisCycle) {
     if (phaseChanged || needsAction) {
       logGameState(gameState, true);
-    } else {
+    } else if (!inBackoff) {
+      // Only log non-verbose state if not in backoff
       logGameState(gameState, false);
     }
+    // If in backoff, stay completely quiet unless phase changed
   }
 
   switch (gameState.phase) {
