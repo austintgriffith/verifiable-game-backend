@@ -936,8 +936,9 @@ async function processGamePhase(gameId) {
         );
 
         if (timeUntilRetry > 0) {
-          // Still in backoff period
-          if (shouldLogThisCycle) {
+          // Still in backoff period - only log occasionally to avoid spam
+          const retryLogKey = `payout_retry_${gameId}`;
+          if (shouldLogWaitingMessage(retryLogKey)) {
             log(
               `⏳ Payout retry ${retryCount}/10 in ${Math.round(
                 timeUntilRetry / 1000
@@ -989,8 +990,9 @@ async function processGamePhase(gameId) {
         );
 
         if (timeUntilRetry > 0) {
-          // Still in backoff period
-          if (shouldLogThisCycle) {
+          // Still in backoff period - only log occasionally to avoid spam
+          const retryLogKey = `reveal_retry_${gameId}`;
+          if (shouldLogWaitingMessage(retryLogKey)) {
             log(
               `⏳ Reveal retry ${currentRevealRetryCount}/5 in ${Math.round(
                 timeUntilRetry / 1000
@@ -1064,10 +1066,14 @@ async function processGamePhase(gameId) {
       payoutLastRetryTime.delete(gameId);
       revealRetryCount.delete(gameId);
       revealLastRetryTime.delete(gameId);
-      // Clean up timer warning keys for this game
+      // Clean up timer warning keys and retry log keys for this game
       const keysToDelete = [];
       for (const [key, value] of lastWaitingLogs.entries()) {
-        if (key.startsWith("timer_warning_")) {
+        if (
+          key.startsWith("timer_warning_") ||
+          key.startsWith("payout_retry_") ||
+          key.startsWith("reveal_retry_")
+        ) {
           keysToDelete.push(key);
         }
       }
@@ -1225,10 +1231,14 @@ async function stopGameServer() {
   }
   gameStartTime = null;
 
-  // Clean up timer warning keys when stopping server
+  // Clean up timer warning keys and retry log keys when stopping server
   const keysToDelete = [];
   for (const [key, value] of lastWaitingLogs.entries()) {
-    if (key.startsWith("timer_warning_")) {
+    if (
+      key.startsWith("timer_warning_") ||
+      key.startsWith("payout_retry_") ||
+      key.startsWith("reveal_retry_")
+    ) {
       keysToDelete.push(key);
     }
   }
