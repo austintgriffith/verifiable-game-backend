@@ -1180,7 +1180,7 @@ async function startGameServer(gameId) {
         args: [BigInt(gameId)],
       });
 
-      const calculatedMapSize = MAP_MULTIPLIER * contractPlayers.length;
+      const calculatedMapSize = 1 + MAP_MULTIPLIER * contractPlayers.length;
       log(
         `🗺️ Generating ${calculatedMapSize}x${calculatedMapSize} map for ${contractPlayers.length} players...`,
         gameId
@@ -1598,7 +1598,7 @@ function getCurrentMapSize() {
   }
   // Otherwise calculate based on current player count
   const playerCount = players.length;
-  return playerCount > 0 ? MAP_MULTIPLIER * playerCount : MAP_MULTIPLIER;
+  return playerCount > 0 ? 1 + MAP_MULTIPLIER * playerCount : 5; // Minimum 5x5
 }
 
 function wrapCoordinate(coord, mapSize = null) {
