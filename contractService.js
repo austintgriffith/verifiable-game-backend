@@ -120,7 +120,7 @@ export async function storeCommitBlockHashForGame(
   globalPublicClient,
   globalWalletClient,
   globalContractAddress,
-  lastWaitingLogs
+  lastWaitingLogs = null
 ) {
   try {
     const blockHashStartKey = `block_hash_start_${gameId}`;

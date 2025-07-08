@@ -119,6 +119,11 @@ export function markGameAsExpired(gameId, gameStates, GamePhase) {
 
 // Logging throttle helper
 export function shouldLogWaitingMessage(gameId, lastWaitingLogs) {
+  // Handle case where lastWaitingLogs is undefined (from internal calls)
+  if (!lastWaitingLogs) {
+    return true; // Always log if no throttling map is available
+  }
+
   const now = Date.now();
   const lastLog = lastWaitingLogs.get(gameId) || 0;
   const timeSinceLastLog = now - lastLog;
