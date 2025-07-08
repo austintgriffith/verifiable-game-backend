@@ -12,17 +12,13 @@ import {
 } from "deterministic-map";
 import dotenv from "dotenv";
 
-// Load environment variables
 dotenv.config();
 
 // ===============================
 // AUTOMATED GAME MANAGER SYSTEM
 // ===============================
 
-// File system constants
 const SAVED_DIR = "saved";
-
-// Ensure saved directory exists
 function ensureSavedDirectory() {
   if (!fs.existsSync(SAVED_DIR)) {
     fs.mkdirSync(SAVED_DIR, { recursive: true });
@@ -30,38 +26,34 @@ function ensureSavedDirectory() {
   }
 }
 
-// Game phases enum
 const GamePhase = {
-  CREATED: "CREATED", // Game created, need to commit hash
-  COMMITTED: "COMMITTED", // Hash committed, game open for players, waiting for close
-  CLOSED: "CLOSED", // Game closed, map size calculated, need to start server
-  GAME_RUNNING: "GAME_RUNNING", // Game server running
-  GAME_FINISHED: "GAME_FINISHED", // All players done, need payout
-  PAYOUT_COMPLETE: "PAYOUT_COMPLETE", // Payout done, need reveal
-  COMPLETE: "COMPLETE", // Reveal done, fully complete
+  CREATED: "CREATED",
+  COMMITTED: "COMMITTED",
+  CLOSED: "CLOSED",
+  GAME_RUNNING: "GAME_RUNNING",
+  GAME_FINISHED: "GAME_FINISHED",
+  PAYOUT_COMPLETE: "PAYOUT_COMPLETE",
+  COMPLETE: "COMPLETE",
 };
 
-// Global state
-let gameStates = new Map(); // Map of gameId -> game state
+let gameStates = new Map();
 let activeGameServer = null;
 let currentGameId = null;
 let expressApp = null;
 let httpServer = null;
 let httpsServer = null;
-let lastWaitingLogs = new Map(); // Map of gameId -> timestamp of last waiting log
-let payoutRetryCount = new Map(); // Map of gameId -> retry count
-let payoutLastRetryTime = new Map(); // Map of gameId -> timestamp of last retry
-let revealRetryCount = new Map(); // Map of gameId -> retry count for reveal
-let revealLastRetryTime = new Map(); // Map of gameId -> timestamp of last reveal retry
+let lastWaitingLogs = new Map();
+let payoutRetryCount = new Map();
+let payoutLastRetryTime = new Map();
+let revealRetryCount = new Map();
+let revealLastRetryTime = new Map();
 let globalAccount = null;
 let globalPublicClient = null;
 let globalWalletClient = null;
 let globalContractAddress = null;
 let completedGamesCount = 0;
 
-// Contract ABIs
 const FULL_CONTRACT_ABI = [
-  // Events
   {
     anonymous: false,
     inputs: [
@@ -117,7 +109,6 @@ const FULL_CONTRACT_ABI = [
     name: "BlockHashStored",
     type: "event",
   },
-  // Contract functions
   {
     inputs: [{ name: "gameId", type: "uint256" }],
     name: "getGameInfo",
@@ -220,13 +211,8 @@ const FULL_CONTRACT_ABI = [
   },
 ];
 
-// ===========================
-// CLIENT INITIALIZATION
-// ===========================
-
 async function initializeGlobalClients() {
   try {
-    // Get contract address from environment
     globalContractAddress = process.env.CONTRACT_ADDRESS;
     if (!globalContractAddress) {
       throw new Error("CONTRACT_ADDRESS not found in .env file");
@@ -247,17 +233,12 @@ async function initializeGlobalClients() {
   }
 }
 
-// ===========================
-// UTILITY FUNCTIONS
-// ===========================
-
 function log(message, gameId = null) {
   const timestamp = new Date().toISOString();
   const prefix = gameId ? `[Game ${gameId}]` : `[System]`;
   console.log(`${timestamp} ${prefix} ${message}`);
 }
 
-// Helper function to check if a block hash is still available
 async function isBlockHashAvailable(gameId) {
   try {
     await globalPublicClient.readContract({
@@ -274,12 +255,10 @@ async function isBlockHashAvailable(gameId) {
     ) {
       return false;
     }
-    // For other errors, assume it's available and let the calling function handle it
     return true;
   }
 }
 
-// Helper function to check if a game is too old to start
 async function isGameTooOldToStart(gameId) {
   try {
     const commitState = await globalPublicClient.readContract({
@@ -292,10 +271,9 @@ async function isGameTooOldToStart(gameId) {
     const [, commitBlockNumber, , , hasCommitted] = commitState;
 
     if (!hasCommitted) {
-      return false; // Game not committed yet, not too old
+      return false;
     }
 
-    // Get current block number
     const currentBlockNumber = await globalPublicClient.getBlockNumber();
     const blocksDiff = currentBlockNumber - commitBlockNumber;
 
@@ -318,7 +296,6 @@ async function isGameTooOldToStart(gameId) {
   }
 }
 
-// Helper function to mark a game as failed due to being too old
 function markGameAsExpired(gameId) {
   const gameState = gameStates.get(gameId);
   if (gameState) {
@@ -462,15 +439,10 @@ function loadGameScores(gameId) {
   }
 }
 
-// ===========================
-// CONTRACT INTERACTION
-// ===========================
-
 async function commitHashForGame(gameId) {
   try {
     log(`Starting commit phase...`, gameId);
 
-    // Check current state
     const currentState = await globalPublicClient.readContract({
       address: globalContractAddress,
       abi: FULL_CONTRACT_ABI,
@@ -487,24 +459,19 @@ async function commitHashForGame(gameId) {
       return true;
     }
 
-    // If hash is committed but block hash not stored, try to store it
     if (hasCommitted && !hasStoredBlockHash) {
       log(`Hash already committed, attempting to store block hash...`, gameId);
       return await storeCommitBlockHashForGame(gameId);
     }
 
-    // Generate random reveal value
     const revealBytes32 = generateRandomReveal();
     log(`Generated reveal value: ${revealBytes32}`, gameId);
 
-    // Hash the reveal value
     const commitHash = keccak256(toBytes(revealBytes32));
     log(`Generated commit hash: ${commitHash}`, gameId);
 
-    // Save reveal value
     saveRevealValue(gameId, revealBytes32);
 
-    // Commit the hash
     log(`Committing hash to contract...`, gameId);
     const commitTxHash = await globalWalletClient.writeContract({
       address: globalContractAddress,
@@ -515,7 +482,6 @@ async function commitHashForGame(gameId) {
 
     log(`Commit transaction: ${commitTxHash}`, gameId);
 
-    // Wait for confirmation
     const receipt = await globalPublicClient.waitForTransactionReceipt({
       hash: commitTxHash,
     });
@@ -524,7 +490,6 @@ async function commitHashForGame(gameId) {
       log(`Commit successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
       log(`Game is now open for players to join`, gameId);
 
-      // Schedule the block hash storage after 15 seconds to ensure block is mined
       log(`Scheduling block hash storage in 15 seconds...`, gameId);
       setTimeout(async () => {
         await storeCommitBlockHashForGame(gameId);
@@ -536,7 +501,6 @@ async function commitHashForGame(gameId) {
       return false;
     }
   } catch (error) {
-    // Handle insufficient funds more gracefully
     if (
       error.message.includes("Sender doesn't have enough funds") ||
       error.message.includes("insufficient funds")
@@ -544,7 +508,6 @@ async function commitHashForGame(gameId) {
       log(`💰 Insufficient funds for commit transaction`, gameId);
       log(`💡 Gamemaster account needs ETH for gas fees`, gameId);
 
-      // Log the specific amounts for debugging
       const errorMsg = error.message;
       const balanceMatch = errorMsg.match(/sender's balance is: (\d+)/);
       const costMatch = errorMsg.match(/max upfront cost is: (\d+)/);
@@ -568,13 +531,11 @@ async function commitHashForGame(gameId) {
 
 async function storeCommitBlockHashForGame(gameId) {
   try {
-    // Only log start message every 30 seconds to avoid spam
     const blockHashStartKey = `block_hash_start_${gameId}`;
     if (shouldLogWaitingMessage(blockHashStartKey)) {
       log(`Starting block hash storage...`, gameId);
     }
 
-    // Check current state
     const currentState = await globalPublicClient.readContract({
       address: globalContractAddress,
       abi: FULL_CONTRACT_ABI,
@@ -594,13 +555,10 @@ async function storeCommitBlockHashForGame(gameId) {
       return true;
     }
 
-    // Debug block timing (throttled to avoid spam)
     const currentBlockNumber = await globalPublicClient.getBlockNumber();
     const blockHashLogKey = `block_hash_waiting_${gameId}`;
 
-    // Check if we're ready based on block numbers
     if (currentBlockNumber < commitBlockNumber) {
-      // Only log debug info every 30 seconds to avoid spam
       if (shouldLogWaitingMessage(blockHashLogKey)) {
         log(`🔍 Block timing debug:`, gameId);
         log(`  - Commit block number: ${commitBlockNumber}`, gameId);
@@ -618,7 +576,6 @@ async function storeCommitBlockHashForGame(gameId) {
       return false;
     }
 
-    // Store the commit block hash
     log(`Storing commit block hash...`, gameId);
     const storeTxHash = await globalWalletClient.writeContract({
       address: globalContractAddress,
@@ -629,7 +586,6 @@ async function storeCommitBlockHashForGame(gameId) {
 
     log(`Store block hash transaction: ${storeTxHash}`, gameId);
 
-    // Wait for confirmation
     const receipt = await globalPublicClient.waitForTransactionReceipt({
       hash: storeTxHash,
     });
@@ -646,13 +602,11 @@ async function storeCommitBlockHashForGame(gameId) {
       return false;
     }
   } catch (error) {
-    // Handle different types of errors more gracefully
     if (
       error.message.includes("Commit block hash not available") ||
       error.message.includes("too old") ||
       error.message.includes("Must wait for the commit block")
     ) {
-      // Only log block readiness messages every 30 seconds to avoid spam
       const blockHashLogKey = `block_hash_waiting_${gameId}`;
       if (shouldLogWaitingMessage(blockHashLogKey)) {
         log(`❌ Block hash storage error details:`, gameId);
@@ -670,7 +624,6 @@ async function storeCommitBlockHashForGame(gameId) {
       return false;
     } else {
       log(`❌ Unexpected error storing block hash: ${error.message}`, gameId);
-      // Log stack trace for debugging
       if (error.stack) {
         log(`📍 Error stack: ${error.stack}`, gameId);
       }
@@ -683,7 +636,6 @@ async function payoutGame(gameId) {
   try {
     log(`Starting payout phase...`, gameId);
 
-    // Check if already paid out
     const payoutInfo = await globalPublicClient.readContract({
       address: globalContractAddress,
       abi: FULL_CONTRACT_ABI,
@@ -697,7 +649,6 @@ async function payoutGame(gameId) {
       return true;
     }
 
-    // Check retry logic
     const retryCount = payoutRetryCount.get(gameId) || 0;
     const lastRetryTime = payoutLastRetryTime.get(gameId) || 0;
     const now = Date.now();
@@ -705,7 +656,7 @@ async function payoutGame(gameId) {
     const RETRY_BACKOFF_MS = Math.min(
       5000 * Math.pow(2, retryCount - 1),
       300000
-    ); // Exponential backoff, max 5 minutes
+    );
 
     if (retryCount >= MAX_RETRIES) {
       log(`❌ Payout failed after ${MAX_RETRIES} retries - giving up`, gameId);
@@ -714,17 +665,13 @@ async function payoutGame(gameId) {
         gameId
       );
 
-      // Move to next phase anyway to prevent infinite loop
       log(
         `⚠️ Skipping to reveal phase due to persistent payout failures`,
         gameId
       );
 
-      // Clean up retry tracking
       payoutRetryCount.delete(gameId);
       payoutLastRetryTime.delete(gameId);
-
-      // Update game state to indicate payout was skipped
       const gameState = gameStates.get(gameId);
       if (gameState) {
         gameState.payoutSkipped = true;
@@ -732,23 +679,18 @@ async function payoutGame(gameId) {
         gameStates.set(gameId, gameState);
       }
 
-      return true; // Return true to move to next phase
+      return true;
     }
 
-    // Check if we should wait before retrying
     if (retryCount > 0 && now - lastRetryTime < RETRY_BACKOFF_MS) {
-      // Still in backoff period, don't retry yet
       return false;
     }
-
-    // Load player scores
     const playerScores = loadGameScores(gameId);
     if (playerScores.length === 0) {
       log(`No players found for payout`, gameId);
       return false;
     }
 
-    // Find winners (highest score)
     const highestScore = Math.max(...playerScores.map((p) => p.score));
     const winners = playerScores
       .filter((p) => p.score === highestScore)
@@ -759,7 +701,6 @@ async function payoutGame(gameId) {
       log(`Winner ${index + 1}: ${winner}`, gameId);
     });
 
-    // Execute payout
     log(`Executing payout...`, gameId);
     const payoutTxHash = await globalWalletClient.writeContract({
       address: globalContractAddress,
@@ -770,7 +711,6 @@ async function payoutGame(gameId) {
 
     log(`Payout transaction: ${payoutTxHash}`, gameId);
 
-    // Wait for confirmation
     const receipt = await globalPublicClient.waitForTransactionReceipt({
       hash: payoutTxHash,
     });
@@ -781,7 +721,6 @@ async function payoutGame(gameId) {
         gameId
       );
 
-      // Clear retry tracking on success
       payoutRetryCount.delete(gameId);
       payoutLastRetryTime.delete(gameId);
 
@@ -792,7 +731,6 @@ async function payoutGame(gameId) {
         gameId
       );
 
-      // Increment retry count
       payoutRetryCount.set(gameId, retryCount + 1);
       payoutLastRetryTime.set(gameId, now);
 
@@ -813,7 +751,6 @@ async function payoutGame(gameId) {
       );
       log(`💡 Gamemaster account needs more ETH for gas fees`, gameId);
 
-      // Log the specific amounts for debugging
       const errorMsg = error.message;
       const balanceMatch = errorMsg.match(/sender's balance is: (\d+)/);
       const costMatch = errorMsg.match(/max upfront cost is: (\d+)/);
@@ -988,10 +925,6 @@ async function revealGame(gameId) {
     return false;
   }
 }
-
-// ===========================
-// GAME STATE MANAGEMENT
-// ===========================
 
 async function updateGameState(gameId) {
   try {
@@ -2206,10 +2139,6 @@ let gameStartTime = null;
 let gameTimerDuration = 90; // 90 seconds
 let gameTimerInterval = null;
 
-// Debug flag - SET TO FALSE TO DISABLE HEAVY DEBUGGING
-const heavyDebug = false; // Set to false to disable heavy debugging
-// This will log detailed information about player positions, movements, and API responses
-
 // Game constants
 const MAP_MULTIPLIER = 4;
 const MAX_MOVES = 12;
@@ -2274,14 +2203,6 @@ function getCurrentMapSize() {
 function wrapCoordinate(coord, mapSize = null) {
   const size = mapSize || getCurrentMapSize();
   const result = ((coord % size) + size) % size;
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] wrapCoordinate: coord=${coord}, size=${size}, result=${result}`,
-      currentGameId
-    );
-  }
-
   return result;
 }
 
@@ -2390,15 +2311,6 @@ async function loadPlayersFromContract(gameId) {
       args: [BigInt(gameId)],
     });
 
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] loadPlayersFromContract: Found ${
-          contractPlayers.length
-        } players: ${JSON.stringify(contractPlayers)}`,
-        gameId
-      );
-    }
-
     players = contractPlayers;
     playerPositions.clear();
     playerStats.clear();
@@ -2432,33 +2344,7 @@ async function loadPlayersFromContract(gameId) {
         movesRemaining: MAX_MOVES,
         minesRemaining: MAX_MINES,
       });
-
-      if (heavyDebug) {
-        log(
-          `🔍 [DEBUG] loadPlayersFromContract: Set ${playerAddress} at position ${JSON.stringify(
-            wrappedPos
-          )} (original: ${JSON.stringify(
-            startPos
-          )}) with stats {score:0, moves:${MAX_MOVES}, mines:${MAX_MINES}}`,
-          gameId
-        );
-      }
     });
-
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] loadPlayersFromContract: Final playerPositions map: ${JSON.stringify(
-          Object.fromEntries(playerPositions)
-        )}`,
-        gameId
-      );
-      log(
-        `🔍 [DEBUG] loadPlayersFromContract: Final playerStats map: ${JSON.stringify(
-          Object.fromEntries(playerStats)
-        )}`,
-        gameId
-      );
-    }
 
     log(`Loaded ${contractPlayers.length} players from contract`, gameId);
     return true;
@@ -2508,25 +2394,10 @@ function authenticateToken(req, res, next) {
     }
 
     if (!isValidPlayer(decoded.address)) {
-      if (heavyDebug) {
-        log(
-          `🔍 [DEBUG] authenticateToken: Player ${
-            decoded.address
-          } is not valid. Current players: ${JSON.stringify(players)}`,
-          currentGameId
-        );
-      }
       return res.status(403).json({ error: "Player no longer registered" });
     }
 
     req.playerAddress = decoded.address;
-
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] authenticateToken: Authenticated player ${decoded.address}`,
-        currentGameId
-      );
-    }
 
     next();
   });
@@ -2536,22 +2407,7 @@ function authenticateToken(req, res, next) {
 function getLocalMapView(playerAddress) {
   const position = playerPositions.get(playerAddress.toLowerCase());
   if (!position) {
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] getLocalMapView: No position found for ${playerAddress}`,
-        currentGameId
-      );
-    }
     return null;
-  }
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] getLocalMapView for ${playerAddress}: position=${JSON.stringify(
-        position
-      )}, mapSize=${gameMap.size}`,
-      currentGameId
-    );
   }
 
   const localView = [];
@@ -2573,67 +2429,36 @@ function getLocalMapView(playerAddress) {
     localView.push(row);
   }
 
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] getLocalMapView result: localView=${JSON.stringify(
-        localView
-      )}, position=${JSON.stringify(position)}, mapSize=${gameMap.size}`,
-      currentGameId
-    );
-  }
-
   return { view: localView, position };
 }
 
 function movePlayer(playerAddress, direction) {
   const currentPos = playerPositions.get(playerAddress.toLowerCase());
   if (!currentPos) {
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] movePlayer: No position found for ${playerAddress}`,
-        currentGameId
-      );
-    }
     return { success: false, error: "Player not found" };
   }
 
   const stats = playerStats.get(playerAddress.toLowerCase());
   if (!stats) {
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] movePlayer: No stats found for ${playerAddress}`,
-        currentGameId
-      );
-    }
     return { success: false, error: "Player stats not found" };
-  }
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] movePlayer for ${playerAddress}: direction=${direction}, currentPos=${JSON.stringify(
-        currentPos
-      )}, stats=${JSON.stringify(stats)}`,
-      currentGameId
-    );
   }
 
   if (stats.movesRemaining <= 0)
     return { success: false, error: "No moves remaining" };
 
-  const dirVector = DIRECTIONS[direction.toLowerCase()];
-  if (!dirVector) return { success: false, error: "Invalid direction" };
+  // Simple validation - prevent crashes and ensure valid direction
+  if (typeof direction !== "string") {
+    return { success: false, error: "Direction must be a string" };
+  }
+
+  const normalizedDirection = direction.toLowerCase().trim();
+  const dirVector = DIRECTIONS[normalizedDirection];
+  if (!dirVector) {
+    return { success: false, error: "Invalid direction" };
+  }
 
   const newX = wrapCoordinate(currentPos.x + dirVector.x, gameMap.size);
   const newY = wrapCoordinate(currentPos.y + dirVector.y, gameMap.size);
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] movePlayer calculation: dirVector=${JSON.stringify(
-        dirVector
-      )}, newX=${newX}, newY=${newY}, mapSize=${gameMap.size}`,
-      currentGameId
-    );
-  }
 
   playerPositions.set(playerAddress.toLowerCase(), { x: newX, y: newY });
   stats.movesRemaining--;
@@ -2648,46 +2473,18 @@ function movePlayer(playerAddress, direction) {
     score: stats.score,
   };
 
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] movePlayer result: ${JSON.stringify(result)}`,
-      currentGameId
-    );
-  }
-
   return result;
 }
 
 function minePlayer(playerAddress) {
   const currentPos = playerPositions.get(playerAddress.toLowerCase());
   if (!currentPos) {
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] minePlayer: No position found for ${playerAddress}`,
-        currentGameId
-      );
-    }
     return { success: false, error: "Player not found" };
   }
 
   const stats = playerStats.get(playerAddress.toLowerCase());
   if (!stats) {
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] minePlayer: No stats found for ${playerAddress}`,
-        currentGameId
-      );
-    }
     return { success: false, error: "Player stats not found" };
-  }
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] minePlayer for ${playerAddress}: currentPos=${JSON.stringify(
-        currentPos
-      )}, stats=${JSON.stringify(stats)}`,
-      currentGameId
-    );
   }
 
   if (stats.minesRemaining <= 0)
@@ -2712,13 +2509,6 @@ function minePlayer(playerAddress) {
     minesRemaining: stats.minesRemaining,
     movesRemaining: stats.movesRemaining,
   };
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] minePlayer result: ${JSON.stringify(result)}`,
-      currentGameId
-    );
-  }
 
   return result;
 }
@@ -2827,35 +2617,13 @@ app.post("/register", async (req, res) => {
 });
 
 app.get("/map", authenticateToken, (req, res) => {
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] /map endpoint called by ${req.playerAddress}`,
-      currentGameId
-    );
-  }
-
   const localView = getLocalMapView(req.playerAddress);
   if (!localView) {
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] /map: localView is null for ${req.playerAddress}`,
-        currentGameId
-      );
-    }
     return res.status(404).json({ error: "Player not found" });
   }
 
   const stats = playerStats.get(req.playerAddress.toLowerCase());
   const timeRemaining = getTimeRemaining();
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] /map: stats=${JSON.stringify(
-        stats
-      )}, timeRemaining=${timeRemaining}`,
-      currentGameId
-    );
-  }
 
   const response = {
     success: true,
@@ -2875,29 +2643,14 @@ app.get("/map", authenticateToken, (req, res) => {
     },
   };
 
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] /map response for ${req.playerAddress}: ${JSON.stringify(
-        response
-      )}`,
-      currentGameId
-    );
-  }
-
   res.json(response);
 });
 
 app.post("/move", authenticateToken, (req, res) => {
   const { direction } = req.body;
+
   if (!direction) {
     return res.status(400).json({ error: "Direction required" });
-  }
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] /move endpoint called by ${req.playerAddress}, direction=${direction}`,
-      currentGameId
-    );
   }
 
   const timeRemaining = getTimeRemaining();
@@ -2907,12 +2660,6 @@ app.post("/move", authenticateToken, (req, res) => {
 
   const moveResult = movePlayer(req.playerAddress, direction);
   if (!moveResult.success) {
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] /move: movePlayer failed for ${req.playerAddress}: ${moveResult.error}`,
-        currentGameId
-      );
-    }
     return res.status(400).json({ error: moveResult.error });
   }
 
@@ -2932,26 +2679,10 @@ app.post("/move", authenticateToken, (req, res) => {
     validDirections: Object.keys(DIRECTIONS),
   };
 
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] /move response for ${req.playerAddress}: ${JSON.stringify(
-        response
-      )}`,
-      currentGameId
-    );
-  }
-
   res.json(response);
 });
 
 app.post("/mine", authenticateToken, (req, res) => {
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] /mine endpoint called by ${req.playerAddress}`,
-      currentGameId
-    );
-  }
-
   const timeRemaining = getTimeRemaining();
   if (timeRemaining <= 0) {
     return res.status(400).json({ error: "Time expired! Game over." });
@@ -2959,12 +2690,6 @@ app.post("/mine", authenticateToken, (req, res) => {
 
   const mineResult = minePlayer(req.playerAddress);
   if (!mineResult.success) {
-    if (heavyDebug) {
-      log(
-        `🔍 [DEBUG] /mine: minePlayer failed for ${req.playerAddress}: ${mineResult.error}`,
-        currentGameId
-      );
-    }
     return res.status(400).json({ error: mineResult.error });
   }
 
@@ -2982,15 +2707,6 @@ app.post("/mine", authenticateToken, (req, res) => {
     timeRemaining: timeRemaining,
     localView: localView.view,
   };
-
-  if (heavyDebug) {
-    log(
-      `🔍 [DEBUG] /mine response for ${req.playerAddress}: ${JSON.stringify(
-        response
-      )}`,
-      currentGameId
-    );
-  }
 
   res.json(response);
 });
