@@ -1,16 +1,29 @@
-import express from "express";
-import fs from "fs";
-import https from "https";
-import crypto from "crypto";
-import jwt from "jsonwebtoken";
-import { createClients, createPublicClientForChain } from "./clients.js";
-import { verifyMessage, keccak256, toBytes, toHex, concat } from "viem";
-import {
-  DeterministicDice,
-  GameLandGenerator,
-  PlayerPositionGenerator,
-} from "deterministic-map";
 import dotenv from "dotenv";
+import fs from "fs";
+import { createClients } from "./clients.js";
+import { DeterministicDice, GameLandGenerator } from "deterministic-map";
+import { GamePhase, SAVED_DIR, FULL_CONTRACT_ABI } from "./constants.js";
+import {
+  log,
+  safeJsonConvert,
+  isGameTooOldToStart,
+  markGameAsExpired,
+  isBlockHashAvailable,
+} from "./utils.js";
+import {
+  ensureSavedDirectory,
+  saveGameMap,
+  saveGameScores,
+  calculateRandomHash,
+  loadRevealValue,
+} from "./fileService.js";
+import {
+  initializeGameServer,
+  cleanupGameServer,
+  getCurrentPlayerData,
+} from "./gameServer.js";
+import { processGamePhase, monitorGameProgress } from "./gameStateManager.js";
+import { scanForExistingGames, setupEventListeners } from "./eventListener.js";
 
 dotenv.config();
 
@@ -18,28 +31,10 @@ dotenv.config();
 // AUTOMATED GAME MANAGER SYSTEM
 // ===============================
 
-const SAVED_DIR = "saved";
-function ensureSavedDirectory() {
-  if (!fs.existsSync(SAVED_DIR)) {
-    fs.mkdirSync(SAVED_DIR, { recursive: true });
-    log(`📁 Created saved directory: ${SAVED_DIR}`);
-  }
-}
-
-const GamePhase = {
-  CREATED: "CREATED",
-  COMMITTED: "COMMITTED",
-  CLOSED: "CLOSED",
-  GAME_RUNNING: "GAME_RUNNING",
-  GAME_FINISHED: "GAME_FINISHED",
-  PAYOUT_COMPLETE: "PAYOUT_COMPLETE",
-  COMPLETE: "COMPLETE",
-};
-
+// Global state
 let gameStates = new Map();
 let activeGameServer = null;
 let currentGameId = null;
-let expressApp = null;
 let httpServer = null;
 let httpsServer = null;
 let lastWaitingLogs = new Map();
@@ -53,164 +48,7 @@ let globalWalletClient = null;
 let globalContractAddress = null;
 let completedGamesCount = 0;
 
-const FULL_CONTRACT_ABI = [
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: "gameId", type: "uint256" },
-      { indexed: true, name: "gamemaster", type: "address" },
-      { indexed: true, name: "creator", type: "address" },
-      { indexed: false, name: "stakeAmount", type: "uint256" },
-    ],
-    name: "GameCreated",
-    type: "event",
-  },
-  {
-    anonymous: false,
-    inputs: [{ indexed: true, name: "gameId", type: "uint256" }],
-    name: "GameOpened",
-    type: "event",
-  },
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: "gameId", type: "uint256" },
-      { indexed: false, name: "startTime", type: "uint256" },
-      { indexed: false, name: "mapSize", type: "uint256" },
-    ],
-    name: "GameClosed",
-    type: "event",
-  },
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: "gameId", type: "uint256" },
-      { indexed: true, name: "player", type: "address" },
-    ],
-    name: "PlayerJoined",
-    type: "event",
-  },
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: "gameId", type: "uint256" },
-      { indexed: true, name: "committedHash", type: "bytes32" },
-      { indexed: false, name: "nextBlockNumber", type: "uint256" },
-    ],
-    name: "HashCommitted",
-    type: "event",
-  },
-  {
-    anonymous: false,
-    inputs: [
-      { indexed: true, name: "gameId", type: "uint256" },
-      { indexed: false, name: "blockHash", type: "bytes32" },
-    ],
-    name: "BlockHashStored",
-    type: "event",
-  },
-  {
-    inputs: [{ name: "gameId", type: "uint256" }],
-    name: "getGameInfo",
-    outputs: [
-      { name: "gamemaster", type: "address" },
-      { name: "creator", type: "address" },
-      { name: "stakeAmount", type: "uint256" },
-      { name: "open", type: "bool" },
-      { name: "playerCount", type: "uint256" },
-      { name: "hasOpened", type: "bool" },
-      { name: "hasClosed", type: "bool" },
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [{ name: "gameId", type: "uint256" }],
-    name: "getPlayers",
-    outputs: [{ name: "", type: "address[]" }],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [{ name: "gameId", type: "uint256" }],
-    name: "getCommitRevealState",
-    outputs: [
-      { name: "_committedHash", type: "bytes32" },
-      { name: "_commitBlockNumber", type: "uint256" },
-      { name: "_revealValue", type: "bytes32" },
-      { name: "_randomHash", type: "bytes32" },
-      { name: "_hasCommitted", type: "bool" },
-      { name: "_hasRevealed", type: "bool" },
-      { name: "_hasStoredBlockHash", type: "bool" },
-      { name: "_mapSize", type: "uint256" },
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [{ name: "gameId", type: "uint256" }],
-    name: "getPayoutInfo",
-    outputs: [
-      { name: "winners", type: "address[]" },
-      { name: "payoutAmount", type: "uint256" },
-      { name: "hasPaidOut", type: "bool" },
-    ],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [
-      { name: "gameId", type: "uint256" },
-      { name: "_hash", type: "bytes32" },
-    ],
-    name: "commitHash",
-    outputs: [],
-    stateMutability: "nonpayable",
-    type: "function",
-  },
-  {
-    inputs: [{ name: "gameId", type: "uint256" }],
-    name: "storeCommitBlockHash",
-    outputs: [],
-    stateMutability: "nonpayable",
-    type: "function",
-  },
-  {
-    inputs: [
-      { name: "gameId", type: "uint256" },
-      { name: "_reveal", type: "bytes32" },
-    ],
-    name: "revealHash",
-    outputs: [],
-    stateMutability: "nonpayable",
-    type: "function",
-  },
-  {
-    inputs: [
-      { name: "gameId", type: "uint256" },
-      { name: "_winners", type: "address[]" },
-    ],
-    name: "payout",
-    outputs: [],
-    stateMutability: "nonpayable",
-    type: "function",
-  },
-  {
-    inputs: [{ name: "gameId", type: "uint256" }],
-    name: "getMapSize",
-    outputs: [{ name: "", type: "uint256" }],
-    stateMutability: "view",
-    type: "function",
-  },
-  {
-    inputs: [{ name: "gameId", type: "uint256" }],
-    name: "getCommitBlockHash",
-    outputs: [{ name: "", type: "bytes32" }],
-    stateMutability: "view",
-    type: "function",
-  },
-];
-
+// Initialize global blockchain clients
 async function initializeGlobalClients() {
   try {
     globalContractAddress = process.env.CONTRACT_ADDRESS;
@@ -233,1220 +71,45 @@ async function initializeGlobalClients() {
   }
 }
 
-function log(message, gameId = null) {
-  const timestamp = new Date().toISOString();
-  const prefix = gameId ? `[Game ${gameId}]` : `[System]`;
-  console.log(`${timestamp} ${prefix} ${message}`);
-}
-
-async function isBlockHashAvailable(gameId) {
-  try {
-    await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getCommitBlockHash",
-      args: [BigInt(gameId)],
-    });
-    return true;
-  } catch (error) {
-    if (
-      error.message.includes("Commit block hash not available") ||
-      error.message.includes("too old")
-    ) {
-      return false;
-    }
-    return true;
-  }
-}
-
-async function isGameTooOldToStart(gameId) {
-  try {
-    const commitState = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getCommitRevealState",
-      args: [BigInt(gameId)],
-    });
-
-    const [, commitBlockNumber, , , hasCommitted] = commitState;
-
-    if (!hasCommitted) {
-      return false;
-    }
-
-    const currentBlockNumber = await globalPublicClient.getBlockNumber();
-    const blocksDiff = currentBlockNumber - commitBlockNumber;
-
-    // Ethereum typically keeps 256 blocks of history
-    // We'll use 240 as a safety margin
-    const MAX_BLOCK_AGE = 240;
-
-    if (blocksDiff > MAX_BLOCK_AGE) {
-      log(
-        `⚠️ Game is too old to start: committed at block ${commitBlockNumber}, current block ${currentBlockNumber} (${blocksDiff} blocks ago)`,
-        gameId
-      );
-      return true;
-    }
-
-    return false;
-  } catch (error) {
-    log(`❌ Error checking game age: ${error.message}`, gameId);
-    return false;
-  }
-}
-
-function markGameAsExpired(gameId) {
-  const gameState = gameStates.get(gameId);
-  if (gameState) {
-    gameState.phase = GamePhase.COMPLETE;
-    gameState.expired = true;
-    gameState.expiredReason = "Block hash too old - game cannot be started";
-    gameStates.set(gameId, gameState);
-
-    log(
-      `❌ Game marked as EXPIRED: Block hash too old to start game server`,
-      gameId
-    );
-    log(
-      `💡 This happens when too much time passes between commit and game closure`,
-      gameId
-    );
-    log(
-      `⏰ Games must be closed within ~50 minutes of commit (256 blocks)`,
-      gameId
-    );
-    log(`🔄 Game will be removed from active processing`, gameId);
-  }
-}
-
-// Helper function to convert BigInt values to numbers for JSON serialization
-function safeJsonConvert(obj) {
-  if (typeof obj === "bigint") {
-    return Number(obj);
-  }
-  if (obj && typeof obj === "object") {
-    if (Array.isArray(obj)) {
-      return obj.map(safeJsonConvert);
-    }
-    const converted = {};
-    for (const [key, value] of Object.entries(obj)) {
-      converted[key] = safeJsonConvert(value);
-    }
-    return converted;
-  }
-  return obj;
-}
-
-function generateRandomReveal() {
-  const randomBytes = new Uint8Array(32);
-  crypto.getRandomValues(randomBytes);
-  return toHex(randomBytes);
-}
-
-function saveRevealValue(gameId, revealValue) {
-  ensureSavedDirectory();
-  const filePath = `${SAVED_DIR}/reveal_${gameId}.txt`;
-  fs.writeFileSync(filePath, revealValue);
-  log(`Saved reveal value to ${filePath}`, gameId);
-}
-
-function loadRevealValue(gameId) {
-  try {
-    const filePath = `${SAVED_DIR}/reveal_${gameId}.txt`;
-    const revealValue = fs.readFileSync(filePath, "utf8").trim();
-    log(`Loaded reveal value from ${filePath}`, gameId);
-    return revealValue;
-  } catch (error) {
-    throw new Error(
-      `Failed to load ${SAVED_DIR}/reveal_${gameId}.txt: ${error.message}`
-    );
-  }
-}
-
-async function calculateRandomHash(gameId, revealValue) {
-  try {
-    log(`Calculating random hash for game ${gameId}...`, gameId);
-
-    // Get the commit block hash from the contract
-    const commitBlockHash = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getCommitBlockHash",
-      args: [BigInt(gameId)],
-    });
-
-    log(`Retrieved commit block hash: ${commitBlockHash}`, gameId);
-    log(`Using reveal value: ${revealValue.substring(0, 10)}...`, gameId);
-
-    // Calculate randomHash exactly as the contract will: keccak256(abi.encodePacked(blockHash, revealValue))
-    const randomHash = keccak256(concat([commitBlockHash, revealValue]));
-
-    log(`Calculated random hash: ${randomHash}`, gameId);
-    log(`This should match the contract's randomHash when revealed`, gameId);
-
-    return randomHash;
-  } catch (error) {
-    throw new Error(
-      `Failed to calculate random hash for game ${gameId}: ${error.message}`
-    );
-  }
-}
-
-function saveGameMap(gameId, mapData) {
-  ensureSavedDirectory();
-  const filePath = `${SAVED_DIR}/map_${gameId}.txt`;
-  fs.writeFileSync(filePath, JSON.stringify(mapData, null, 2));
-  log(`Saved map to ${filePath}`, gameId);
-}
-
-function loadGameMap(gameId) {
-  try {
-    const filePath = `${SAVED_DIR}/map_${gameId}.txt`;
-    const mapData = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    log(`Loaded ${mapData.size}x${mapData.size} map from ${filePath}`, gameId);
-    return mapData;
-  } catch (error) {
-    throw new Error(
-      `Failed to load ${SAVED_DIR}/map_${gameId}.txt: ${error.message}`
-    );
-  }
-}
-
-function saveGameScores(gameId, playerData) {
-  const scoresData = {
-    gameId: gameId,
-    players: playerData,
-    count: playerData.length,
-    savedAt: new Date().toISOString(),
-  };
-  ensureSavedDirectory();
-  const filePath = `${SAVED_DIR}/scores_${gameId}.txt`;
-  fs.writeFileSync(filePath, JSON.stringify(scoresData, null, 2));
-  log(`Saved final scores to ${filePath}`, gameId);
-}
-
-function loadGameScores(gameId) {
-  try {
-    const filePath = `${SAVED_DIR}/scores_${gameId}.txt`;
-    const scoresData = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    log(`Loaded scores from ${filePath}`, gameId);
-    return scoresData.players;
-  } catch (error) {
-    throw new Error(
-      `Failed to load ${SAVED_DIR}/scores_${gameId}.txt: ${error.message}`
-    );
-  }
-}
-
-async function commitHashForGame(gameId) {
-  try {
-    log(`Starting commit phase...`, gameId);
-
-    const currentState = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getCommitRevealState",
-      args: [BigInt(gameId)],
-    });
-
-    const [, , , , hasCommitted, , hasStoredBlockHash] = currentState;
-    if (hasCommitted && hasStoredBlockHash) {
-      log(
-        `Hash already committed and block hash stored for game ${gameId}`,
-        gameId
-      );
-      return true;
-    }
-
-    if (hasCommitted && !hasStoredBlockHash) {
-      log(`Hash already committed, attempting to store block hash...`, gameId);
-      return await storeCommitBlockHashForGame(gameId);
-    }
-
-    const revealBytes32 = generateRandomReveal();
-    log(`Generated reveal value: ${revealBytes32}`, gameId);
-
-    const commitHash = keccak256(toBytes(revealBytes32));
-    log(`Generated commit hash: ${commitHash}`, gameId);
-
-    saveRevealValue(gameId, revealBytes32);
-
-    log(`Committing hash to contract...`, gameId);
-    const commitTxHash = await globalWalletClient.writeContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "commitHash",
-      args: [BigInt(gameId), commitHash],
-    });
-
-    log(`Commit transaction: ${commitTxHash}`, gameId);
-
-    const receipt = await globalPublicClient.waitForTransactionReceipt({
-      hash: commitTxHash,
-    });
-
-    if (receipt.status === "success") {
-      log(`Commit successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
-      log(`Game is now open for players to join`, gameId);
-
-      log(`Scheduling block hash storage in 15 seconds...`, gameId);
-      setTimeout(async () => {
-        await storeCommitBlockHashForGame(gameId);
-      }, 15000);
-
-      return true;
-    } else {
-      log(`Commit failed!`, gameId);
-      return false;
-    }
-  } catch (error) {
-    if (
-      error.message.includes("Sender doesn't have enough funds") ||
-      error.message.includes("insufficient funds")
-    ) {
-      log(`💰 Insufficient funds for commit transaction`, gameId);
-      log(`💡 Gamemaster account needs ETH for gas fees`, gameId);
-
-      const errorMsg = error.message;
-      const balanceMatch = errorMsg.match(/sender's balance is: (\d+)/);
-      const costMatch = errorMsg.match(/max upfront cost is: (\d+)/);
-
-      if (balanceMatch && costMatch) {
-        const balance = parseInt(balanceMatch[1]);
-        const cost = parseInt(costMatch[1]);
-        log(`💰 Current balance: ${(balance / 1e18).toFixed(6)} ETH`, gameId);
-        log(`💰 Required for tx: ${(cost / 1e18).toFixed(6)} ETH`, gameId);
-        log(
-          `💰 Need additional: ${((cost - balance) / 1e18).toFixed(6)} ETH`,
-          gameId
-        );
-      }
-    } else {
-      log(`Error in commit phase: ${error.message}`, gameId);
-    }
-    return false;
-  }
-}
-
-async function storeCommitBlockHashForGame(gameId) {
-  try {
-    const blockHashStartKey = `block_hash_start_${gameId}`;
-    if (shouldLogWaitingMessage(blockHashStartKey)) {
-      log(`Starting block hash storage...`, gameId);
-    }
-
-    const currentState = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getCommitRevealState",
-      args: [BigInt(gameId)],
-    });
-
-    const [, commitBlockNumber, , , hasCommitted, , hasStoredBlockHash] =
-      currentState;
-    if (!hasCommitted) {
-      log(`No hash committed yet for game ${gameId}`, gameId);
-      return false;
-    }
-
-    if (hasStoredBlockHash) {
-      log(`Block hash already stored for game ${gameId}`, gameId);
-      return true;
-    }
-
-    const currentBlockNumber = await globalPublicClient.getBlockNumber();
-    const blockHashLogKey = `block_hash_waiting_${gameId}`;
-
-    if (currentBlockNumber < commitBlockNumber) {
-      if (shouldLogWaitingMessage(blockHashLogKey)) {
-        log(`🔍 Block timing debug:`, gameId);
-        log(`  - Commit block number: ${commitBlockNumber}`, gameId);
-        log(`  - Current block number: ${currentBlockNumber}`, gameId);
-        log(
-          `  - Blocks passed: ${currentBlockNumber - commitBlockNumber}`,
-          gameId
-        );
-        log(`  - Ready: NO`, gameId);
-        log(
-          `⏰ Still waiting for commit block ${commitBlockNumber} (currently at ${currentBlockNumber})`,
-          gameId
-        );
-      }
-      return false;
-    }
-
-    log(`Storing commit block hash...`, gameId);
-    const storeTxHash = await globalWalletClient.writeContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "storeCommitBlockHash",
-      args: [BigInt(gameId)],
-    });
-
-    log(`Store block hash transaction: ${storeTxHash}`, gameId);
-
-    const receipt = await globalPublicClient.waitForTransactionReceipt({
-      hash: storeTxHash,
-    });
-
-    if (receipt.status === "success") {
-      log(
-        `Block hash stored successfully! Gas used: ${receipt.gasUsed.toString()}`,
-        gameId
-      );
-      log(`Commit phase fully completed - game ready for closure`, gameId);
-      return true;
-    } else {
-      log(`Block hash storage failed!`, gameId);
-      return false;
-    }
-  } catch (error) {
-    if (
-      error.message.includes("Commit block hash not available") ||
-      error.message.includes("too old") ||
-      error.message.includes("Must wait for the commit block")
-    ) {
-      const blockHashLogKey = `block_hash_waiting_${gameId}`;
-      if (shouldLogWaitingMessage(blockHashLogKey)) {
-        log(`❌ Block hash storage error details:`, gameId);
-        log(`  - Error message: ${error.message}`, gameId);
-        log(`  - Error type: ${error.name || "Unknown"}`, gameId);
-        log(`⏳ Block not ready yet for hash storage, will retry...`, gameId);
-      }
-      return false;
-    } else if (
-      error.message.includes("Sender doesn't have enough funds") ||
-      error.message.includes("insufficient funds")
-    ) {
-      log(`💰 Insufficient funds for block hash storage`, gameId);
-      log(`💡 Gamemaster account needs more ETH for gas fees`, gameId);
-      return false;
-    } else {
-      log(`❌ Unexpected error storing block hash: ${error.message}`, gameId);
-      if (error.stack) {
-        log(`📍 Error stack: ${error.stack}`, gameId);
-      }
-      return false;
-    }
-  }
-}
-
-async function payoutGame(gameId) {
-  try {
-    log(`Starting payout phase...`, gameId);
-
-    const payoutInfo = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getPayoutInfo",
-      args: [BigInt(gameId)],
-    });
-
-    const [, , hasPaidOut] = payoutInfo;
-    if (hasPaidOut) {
-      log(`Game already paid out`, gameId);
-      return true;
-    }
-
-    const retryCount = payoutRetryCount.get(gameId) || 0;
-    const lastRetryTime = payoutLastRetryTime.get(gameId) || 0;
-    const now = Date.now();
-    const MAX_RETRIES = 10;
-    const RETRY_BACKOFF_MS = Math.min(
-      5000 * Math.pow(2, retryCount - 1),
-      300000
-    );
-
-    if (retryCount >= MAX_RETRIES) {
-      log(`❌ Payout failed after ${MAX_RETRIES} retries - giving up`, gameId);
-      log(
-        `💡 Please manually fund the gamemaster account and restart the service`,
-        gameId
-      );
-
-      log(
-        `⚠️ Skipping to reveal phase due to persistent payout failures`,
-        gameId
-      );
-
-      payoutRetryCount.delete(gameId);
-      payoutLastRetryTime.delete(gameId);
-      const gameState = gameStates.get(gameId);
-      if (gameState) {
-        gameState.payoutSkipped = true;
-        gameState.phase = GamePhase.PAYOUT_COMPLETE;
-        gameStates.set(gameId, gameState);
-      }
-
-      return true;
-    }
-
-    if (retryCount > 0 && now - lastRetryTime < RETRY_BACKOFF_MS) {
-      return false;
-    }
-    const playerScores = loadGameScores(gameId);
-    if (playerScores.length === 0) {
-      log(`No players found for payout`, gameId);
-      return false;
-    }
-
-    const highestScore = Math.max(...playerScores.map((p) => p.score));
-    const winners = playerScores
-      .filter((p) => p.score === highestScore)
-      .map((p) => p.address);
-
-    log(`Found ${winners.length} winner(s) with score ${highestScore}`, gameId);
-    winners.forEach((winner, index) => {
-      log(`Winner ${index + 1}: ${winner}`, gameId);
-    });
-
-    log(`Executing payout...`, gameId);
-    const payoutTxHash = await globalWalletClient.writeContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "payout",
-      args: [BigInt(gameId), winners],
-    });
-
-    log(`Payout transaction: ${payoutTxHash}`, gameId);
-
-    const receipt = await globalPublicClient.waitForTransactionReceipt({
-      hash: payoutTxHash,
-    });
-
-    if (receipt.status === "success") {
-      log(
-        `✅ Payout successful! Gas used: ${receipt.gasUsed.toString()}`,
-        gameId
-      );
-
-      payoutRetryCount.delete(gameId);
-      payoutLastRetryTime.delete(gameId);
-
-      return true;
-    } else {
-      log(
-        `❌ Payout transaction failed with status: ${receipt.status}`,
-        gameId
-      );
-
-      payoutRetryCount.set(gameId, retryCount + 1);
-      payoutLastRetryTime.set(gameId, now);
-
-      return false;
-    }
-  } catch (error) {
-    const retryCount = payoutRetryCount.get(gameId) || 0;
-    const now = Date.now();
-
-    // Check if this is an insufficient funds error
-    if (
-      error.message.includes("Sender doesn't have enough funds") ||
-      error.message.includes("insufficient funds")
-    ) {
-      log(
-        `💰 Insufficient funds for payout (attempt ${retryCount + 1}/${10})`,
-        gameId
-      );
-      log(`💡 Gamemaster account needs more ETH for gas fees`, gameId);
-
-      const errorMsg = error.message;
-      const balanceMatch = errorMsg.match(/sender's balance is: (\d+)/);
-      const costMatch = errorMsg.match(/max upfront cost is: (\d+)/);
-
-      if (balanceMatch && costMatch) {
-        const balance = parseInt(balanceMatch[1]);
-        const cost = parseInt(costMatch[1]);
-        log(`💰 Current balance: ${(balance / 1e18).toFixed(6)} ETH`, gameId);
-        log(`💰 Required for tx: ${(cost / 1e18).toFixed(6)} ETH`, gameId);
-        log(
-          `💰 Need additional: ${((cost - balance) / 1e18).toFixed(6)} ETH`,
-          gameId
-        );
-      }
-
-      // Use longer backoff for insufficient funds
-      const BACKOFF_MS = Math.min(10000 * Math.pow(2, retryCount), 600000); // 10s to 10 minutes
-      log(
-        `⏳ Will retry in ${Math.round(BACKOFF_MS / 1000)} seconds...`,
-        gameId
-      );
-    } else {
-      log(`❌ Error in payout phase: ${error.message}`, gameId);
-    }
-
-    // Increment retry count
-    payoutRetryCount.set(gameId, retryCount + 1);
-    payoutLastRetryTime.set(gameId, now);
-
-    return false;
-  }
-}
-
-async function revealGame(gameId) {
-  try {
-    log(`Starting reveal phase...`, gameId);
-
-    // Check current state
-    const currentState = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getCommitRevealState",
-      args: [BigInt(gameId)],
-    });
-
-    const [, , , , hasCommitted, hasRevealed] = currentState;
-    if (!hasCommitted) {
-      log(`No hash committed yet`, gameId);
-      return false;
-    }
-    if (hasRevealed) {
-      log(`Hash already revealed`, gameId);
-      return true;
-    }
-
-    // Check retry logic
-    const retryCount = revealRetryCount.get(gameId) || 0;
-    const lastRetryTime = revealLastRetryTime.get(gameId) || 0;
-    const now = Date.now();
-    const MAX_RETRIES = 1; // Give up immediately since blockhash errors never resolve
-    const RETRY_BACKOFF_MS = 10000; // Short 10 second wait before giving up
-
-    if (retryCount >= MAX_RETRIES) {
-      log(`❌ Reveal failed after ${MAX_RETRIES} retries - giving up`, gameId);
-      log(`💡 Blockhash likely too old, skipping reveal for this game`, gameId);
-
-      // Move to complete phase anyway to prevent infinite loop
-      log(`⚠️ Marking game as complete despite reveal failure`, gameId);
-
-      // Clean up retry tracking
-      revealRetryCount.delete(gameId);
-      revealLastRetryTime.delete(gameId);
-
-      // Update game state to indicate reveal was skipped
-      const gameState = gameStates.get(gameId);
-      if (gameState) {
-        gameState.revealSkipped = true;
-        gameState.phase = GamePhase.COMPLETE;
-        gameStates.set(gameId, gameState);
-      }
-
-      return true; // Return true to move to complete phase
-    }
-
-    // Check if we should wait before retrying
-    if (retryCount > 0 && now - lastRetryTime < RETRY_BACKOFF_MS) {
-      // Still in backoff period, don't retry yet
-      return false;
-    }
-
-    // Load reveal value
-    const revealValue = loadRevealValue(gameId);
-
-    // Reveal the hash
-    log(`Revealing hash...`, gameId);
-    const revealTxHash = await globalWalletClient.writeContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "revealHash",
-      args: [BigInt(gameId), revealValue],
-    });
-
-    log(`Reveal transaction: ${revealTxHash}`, gameId);
-
-    // Wait for confirmation
-    const receipt = await globalPublicClient.waitForTransactionReceipt({
-      hash: revealTxHash,
-    });
-
-    if (receipt.status === "success") {
-      log(`Reveal successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
-
-      // Clear retry tracking on success
-      revealRetryCount.delete(gameId);
-      revealLastRetryTime.delete(gameId);
-
-      // Get final state to show random hash
-      const finalState = await globalPublicClient.readContract({
-        address: globalContractAddress,
-        abi: FULL_CONTRACT_ABI,
-        functionName: "getCommitRevealState",
-        args: [BigInt(gameId)],
-      });
-
-      const [, , , randomHash] = finalState;
-      log(`Generated random hash: ${randomHash}`, gameId);
-
-      return true;
-    } else {
-      log(
-        `❌ Reveal transaction failed with status: ${receipt.status}`,
-        gameId
-      );
-
-      // Increment retry count
-      revealRetryCount.set(gameId, retryCount + 1);
-      revealLastRetryTime.set(gameId, now);
-
-      return false;
-    }
-  } catch (error) {
-    const retryCount = revealRetryCount.get(gameId) || 0;
-    const now = Date.now();
-
-    // Check if this is a "blockhash not available" error
-    if (error.message.includes("Blockhash not available")) {
-      log(
-        `📅 Blockhash too old for reveal (attempt ${
-          retryCount + 1
-        }/1 - will give up)`,
-        gameId
-      );
-      log(
-        `💡 This happens when too much time passes between commit and reveal`,
-        gameId
-      );
-
-      // Short backoff before giving up since blockhash errors never resolve
-      const BACKOFF_MS = 10000; // 10 seconds
-      log(
-        `⏳ Will retry in ${Math.round(BACKOFF_MS / 1000)} seconds...`,
-        gameId
-      );
-    } else {
-      log(`❌ Error in reveal phase: ${error.message}`, gameId);
-    }
-
-    // Increment retry count
-    revealRetryCount.set(gameId, retryCount + 1);
-    revealLastRetryTime.set(gameId, now);
-
-    return false;
-  }
-}
-
-async function updateGameState(gameId) {
-  try {
-    // Get game info
-    const gameInfo = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getGameInfo",
-      args: [BigInt(gameId)],
-    });
-
-    const [
-      gamemaster,
-      creator,
-      stakeAmount,
-      open,
-      playerCount,
-      hasOpened,
-      hasClosed,
-    ] = gameInfo;
-
-    // Get commit-reveal state
-    const commitState = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getCommitRevealState",
-      args: [BigInt(gameId)],
-    });
-
-    const [, , , , hasCommitted, hasRevealed, hasStoredBlockHash, mapSize] =
-      commitState;
-
-    // Get payout state
-    const payoutInfo = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getPayoutInfo",
-      args: [BigInt(gameId)],
-    });
-
-    const [, , hasPaidOut] = payoutInfo;
-
-    // Determine current phase
-    let phase = GamePhase.CREATED;
-    if (hasRevealed) {
-      phase = GamePhase.COMPLETE;
-    } else if (hasPaidOut) {
-      phase = GamePhase.PAYOUT_COMPLETE;
-    } else if (hasClosed && hasCommitted && hasStoredBlockHash) {
-      // Game is closed and fully committed (including block hash stored), check if it's already finished
-      try {
-        const playerScores = loadGameScores(gameId);
-        const allPlayersFinished = playerScores.every((p) => {
-          // Player is finished if:
-          // 1. No mines left (can't mine anymore), OR
-          // 2. No moves left AND standing on depleted tile (can't mine current square)
-          return (
-            p.minesRemaining === 0 || (p.movesRemaining === 0 && p.tile === 0)
-          );
-        });
-        if (allPlayersFinished) {
-          phase = GamePhase.GAME_FINISHED;
-        } else if (activeGameServer === gameId) {
-          // Game not finished but server running
-          phase = GamePhase.GAME_RUNNING;
-        } else {
-          // Game not finished and no server, need to start it
-          phase = GamePhase.CLOSED;
-        }
-      } catch (error) {
-        // No scores file yet, check if server is running
-        if (activeGameServer === gameId) {
-          phase = GamePhase.GAME_RUNNING;
-        } else {
-          // No scores file and no server, need to start it
-          phase = GamePhase.CLOSED;
-        }
-      }
-    } else if (hasCommitted) {
-      phase = GamePhase.COMMITTED;
-    }
-
-    // Update game state - but respect local decisions like revealSkipped
-    const currentState = gameStates.get(gameId) || {};
-
-    // If we've locally decided to skip steps, don't override those decisions
-    if (currentState.payoutSkipped && phase === GamePhase.GAME_FINISHED) {
-      phase = GamePhase.PAYOUT_COMPLETE;
-    }
-    if (currentState.revealSkipped && phase === GamePhase.PAYOUT_COMPLETE) {
-      phase = GamePhase.COMPLETE;
-    }
-
-    gameStates.set(gameId, {
-      ...currentState,
-      gameId,
-      gamemaster,
-      creator,
-      stakeAmount,
-      open,
-      playerCount,
-      hasOpened,
-      hasClosed,
-      hasCommitted,
-      hasRevealed,
-      hasStoredBlockHash,
-      hasPaidOut,
-      mapSize: Number(mapSize) || 0,
-      phase,
-      lastUpdated: Date.now(),
-    });
-
-    return gameStates.get(gameId);
-  } catch (error) {
-    log(`Error updating game state: ${error.message}`, gameId);
-    return null;
-  }
-}
-
-function shouldLogWaitingMessage(gameId) {
-  const now = Date.now();
-  const lastLog = lastWaitingLogs.get(gameId) || 0;
-  const timeSinceLastLog = now - lastLog;
-  const WAITING_LOG_INTERVAL = 30000; // 30 seconds
-
-  if (timeSinceLastLog >= WAITING_LOG_INTERVAL) {
-    lastWaitingLogs.set(gameId, now);
-    return true;
-  }
-  return false;
-}
-
-function logGameState(gameState, verbose = false) {
-  const gameId = gameState.gameId;
-
-  if (verbose) {
-    log(`📊 Game State:`, gameId);
-    log(`  Phase: ${gameState.phase}`, gameId);
-    log(`  Has Opened: ${gameState.hasOpened}`, gameId);
-    log(`  Has Closed: ${gameState.hasClosed}`, gameId);
-    log(`  Has Committed: ${gameState.hasCommitted}`, gameId);
-    log(`  Has Stored Block Hash: ${gameState.hasStoredBlockHash}`, gameId);
-    log(`  Has Revealed: ${gameState.hasRevealed}`, gameId);
-    log(`  Has Paid Out: ${gameState.hasPaidOut}`, gameId);
-    log(`  Player Count: ${gameState.playerCount}`, gameId);
-    log(
-      `  Active Server: ${activeGameServer === gameId ? "YES" : "NO"}`,
-      gameId
-    );
-
-    // Check if scores file exists
-    try {
-      const filePath = `${SAVED_DIR}/scores_${gameId}.txt`;
-      const scores = fs.readFileSync(filePath, "utf8");
-      const scoresData = JSON.parse(scores);
-      log(
-        `  Scores File: EXISTS (${scoresData.players.length} players)`,
-        gameId
-      );
-    } catch (error) {
-      log(`  Scores File: NOT FOUND`, gameId);
-    }
-  } else {
-    // Concise logging - only show important info
-    log(
-      `📊 ${gameState.phase} | Players: ${gameState.playerCount} | Server: ${
-        activeGameServer === gameId ? "YES" : "NO"
-      }`,
-      gameId
-    );
-  }
-}
-
-async function processGamePhase(gameId) {
-  const gameState = await updateGameState(gameId);
-  if (!gameState) {
-    log(`❌ Could not update game state`, gameId);
-    return;
-  }
-
-  // Check if phase changed to decide on verbose logging
-  const lastState = gameStates.get(gameId);
-  const phaseChanged = !lastState || lastState.phase !== gameState.phase;
-
-  // Define immediate action phases (need immediate attention)
-  const immediateActionPhases = [
-    GamePhase.CREATED,
-    GamePhase.CLOSED,
-    GamePhase.GAME_FINISHED,
-    GamePhase.PAYOUT_COMPLETE,
-  ];
-
-  const needsImmediateAction = immediateActionPhases.includes(gameState.phase);
-
-  // Block hash storage is a waiting action, not immediate
-  const needsBlockHashStorage =
-    gameState.phase === GamePhase.COMMITTED &&
-    gameState.hasCommitted &&
-    !gameState.hasStoredBlockHash;
-
-  // Determine if we should log this cycle - only for immediate actions or phase changes
-  const shouldLogThisCycle =
-    phaseChanged || needsImmediateAction || shouldLogWaitingMessage(gameId);
-
-  // Check if game is in backoff period and should be quiet
-  let inBackoff = false;
-  const now = Date.now();
-
-  if (
-    gameState.phase === GamePhase.GAME_FINISHED &&
-    payoutRetryCount.has(gameId)
-  ) {
-    const retryCount = payoutRetryCount.get(gameId);
-    const lastRetryTime = payoutLastRetryTime.get(gameId) || 0;
-    const BACKOFF_MS = Math.min(5000 * Math.pow(2, retryCount - 1), 300000);
-    const timeUntilRetry = Math.max(0, BACKOFF_MS - (now - lastRetryTime));
-    inBackoff = timeUntilRetry > 0;
-  }
-
-  if (
-    gameState.phase === GamePhase.PAYOUT_COMPLETE &&
-    revealRetryCount.has(gameId)
-  ) {
-    const retryCount = revealRetryCount.get(gameId);
-    const lastRetryTime = revealLastRetryTime.get(gameId) || 0;
-    const BACKOFF_MS = 10000; // Match the 10 second backoff in reveal function
-    const timeUntilRetry = Math.max(0, BACKOFF_MS - (now - lastRetryTime));
-    inBackoff = timeUntilRetry > 0;
-  }
-
-  // Log state if needed (but be quiet during backoff periods unless phase changed)
-  if (shouldLogThisCycle) {
-    if (phaseChanged || needsImmediateAction) {
-      logGameState(gameState, true);
-    } else if (!inBackoff) {
-      // Only log non-verbose state if not in backoff
-      logGameState(gameState, false);
-    }
-    // If in backoff, stay completely quiet unless phase changed
-  }
-
-  switch (gameState.phase) {
-    case GamePhase.CREATED:
-      // Need to commit hash and store block hash
-      log(`🎯 Action needed: Commit hash and store block hash`, gameId);
-      const commitSuccess = await commitHashForGame(gameId);
-      if (commitSuccess) {
-        log(`✅ Commit phase completed`, gameId);
-      } else {
-        log(`❌ Commit phase failed`, gameId);
-      }
-      break;
-
-    case GamePhase.COMMITTED:
-      // Check if block hash needs to be stored
-      if (needsBlockHashStorage) {
-        // Only log action messages every 30 seconds to avoid spam
-        const blockHashActionKey = `block_hash_action_${gameId}`;
-        if (shouldLogWaitingMessage(blockHashActionKey)) {
-          log(`🎯 Action needed: Store commit block hash`, gameId);
-        }
-
-        const storeSuccess = await storeCommitBlockHashForGame(gameId);
-        if (storeSuccess) {
-          log(`✅ Block hash storage completed`, gameId);
-        } else {
-          // Only log failure message every 30 seconds to avoid spam
-          if (shouldLogWaitingMessage(blockHashActionKey)) {
-            log(`❌ Block hash storage failed (will retry)`, gameId);
-          }
-        }
-      } else {
-        // Game is open for players to join, wait for game to be closed - only log occasionally
-        if (shouldLogThisCycle && !needsImmediateAction) {
-          log(
-            `⏳ Game is open for players to join. Waiting for game to be closed by creator...`,
-            gameId
-          );
-        }
-      }
-      break;
-
-    case GamePhase.CLOSED:
-      // Game is closed, map size calculated, ready to start game server - but only if no other server is running
-      if (activeGameServer === gameId) {
-        log(`✅ Game server already running for this game`, gameId);
-      } else if (activeGameServer !== null) {
-        // Another game's server is running, wait our turn
-        if (shouldLogThisCycle) {
-          log(
-            `⏳ Waiting for server slot (Game ${activeGameServer} currently active)`,
-            gameId
-          );
-        }
-      } else {
-        // No active server, we can start ours
-        log(`🎯 Action needed: Start game server`, gameId);
-        const serverStarted = await startGameServer(gameId);
-        if (!serverStarted) {
-          // Game was already finished, update phase
-          const updatedGameState = gameStates.get(gameId);
-          if (updatedGameState) {
-            updatedGameState.phase = GamePhase.GAME_FINISHED;
-            gameStates.set(gameId, updatedGameState);
-            log(
-              `📊 Game phase updated to GAME_FINISHED (already completed)`,
-              gameId
-            );
-          }
-        }
-      }
-      break;
-
-    case GamePhase.GAME_RUNNING:
-      // Monitor game progress and auto-finish when players are done
-      await monitorGameProgress(gameId);
-      break;
-
-    case GamePhase.GAME_FINISHED:
-      // Run payout
-      const retryCount = payoutRetryCount.get(gameId) || 0;
-      const lastRetryTime = payoutLastRetryTime.get(gameId) || 0;
-      const now = Date.now();
-
-      if (retryCount > 0) {
-        const RETRY_BACKOFF_MS = Math.min(
-          5000 * Math.pow(2, retryCount - 1),
-          300000
-        );
-        const timeUntilRetry = Math.max(
-          0,
-          RETRY_BACKOFF_MS - (now - lastRetryTime)
-        );
-
-        if (timeUntilRetry > 0) {
-          // Still in backoff period - only log occasionally to avoid spam
-          const retryLogKey = `payout_retry_${gameId}`;
-          if (shouldLogWaitingMessage(retryLogKey)) {
-            log(
-              `⏳ Payout retry ${retryCount}/10 in ${Math.round(
-                timeUntilRetry / 1000
-              )}s (insufficient funds)`,
-              gameId
-            );
-          }
-          break;
-        }
-      }
-
-      log(
-        `🎯 Action needed: Execute payout${
-          retryCount > 0 ? ` (retry ${retryCount + 1}/10)` : ""
-        }`,
-        gameId
-      );
-      const payoutSuccess = await payoutGame(gameId);
-      if (payoutSuccess) {
-        log(`✅ Payout phase completed`, gameId);
-      } else {
-        const newRetryCount = payoutRetryCount.get(gameId) || 0;
-        if (newRetryCount < 10) {
-          log(`❌ Payout phase failed (will retry)`, gameId);
-        }
-      }
-      break;
-
-    case GamePhase.PAYOUT_COMPLETE:
-      // Run reveal
-      const currentGameState = gameStates.get(gameId);
-      if (currentGameState && currentGameState.payoutSkipped) {
-        log(`⚠️ Note: Payout was skipped due to insufficient funds`, gameId);
-        log(`💡 Winners were not paid out on-chain`, gameId);
-      }
-
-      const currentRevealRetryCount = revealRetryCount.get(gameId) || 0;
-      const currentRevealLastRetryTime = revealLastRetryTime.get(gameId) || 0;
-      const currentTime = Date.now();
-
-      if (currentRevealRetryCount > 0) {
-        const RETRY_BACKOFF_MS = 10000; // Short 10 second wait before giving up
-        const timeUntilRetry = Math.max(
-          0,
-          RETRY_BACKOFF_MS - (currentTime - currentRevealLastRetryTime)
-        );
-
-        if (timeUntilRetry > 0) {
-          // Still in backoff period - only log occasionally to avoid spam
-          const retryLogKey = `reveal_retry_${gameId}`;
-          if (shouldLogWaitingMessage(retryLogKey)) {
-            log(
-              `⏳ Final reveal attempt in ${Math.round(
-                timeUntilRetry / 1000
-              )}s (blockhash too old - will give up after this)`,
-              gameId
-            );
-          }
-          break;
-        }
-      }
-
-      log(
-        `🎯 Action needed: Reveal hash${
-          currentRevealRetryCount > 0
-            ? ` (final attempt - will give up if this fails)`
-            : ""
-        }`,
-        gameId
-      );
-      const revealSuccess = await revealGame(gameId);
-      if (revealSuccess) {
-        const finalGameState = gameStates.get(gameId);
-        if (finalGameState && finalGameState.revealSkipped) {
-          log(
-            `⚠️ Note: Reveal was skipped due to blockhash being too old`,
-            gameId
-          );
-          log(
-            `💡 Game is complete but random hash was not revealed on-chain`,
-            gameId
-          );
-        }
-        log(`✅ Reveal phase completed`, gameId);
-
-        // Schedule delayed shutdown of game server to give frontend time to finish
-        log(`⏲️ Scheduling game server shutdown in 15 seconds...`, gameId);
-        setTimeout(() => {
-          if (activeGameServer === gameId) {
-            log(
-              `🛑 Delayed shutdown: Stopping game server for completed game ${gameId}`,
-              gameId
-            );
-            stopGameServer();
-          } else {
-            log(
-              `⏭️ Skipping delayed shutdown - different game server now active`,
-              gameId
-            );
-          }
-        }, 15000); // 15 second delay
-      } else {
-        const newRetryCount = revealRetryCount.get(gameId) || 0;
-        if (newRetryCount < 1) {
-          log(`❌ Reveal phase failed (will retry)`, gameId);
-        }
-      }
-      break;
-
-    case GamePhase.COMPLETE:
-      log(`🎉 Game fully completed!`, gameId);
-      completedGamesCount++;
-      log(
-        `🗑️ Removing game ${gameId} from active processing (${completedGamesCount} total completed)`,
-        gameId
-      );
-      gameStates.delete(gameId);
-      // Clean up logging throttle data
-      lastWaitingLogs.delete(gameId);
-      // Clean up retry tracking data
-      payoutRetryCount.delete(gameId);
-      payoutLastRetryTime.delete(gameId);
-      revealRetryCount.delete(gameId);
-      revealLastRetryTime.delete(gameId);
-      // Clean up timer warning keys and retry log keys for this game
-      const keysToDelete = [];
-      for (const [key, value] of lastWaitingLogs.entries()) {
-        if (
-          key.startsWith("timer_warning_") ||
-          key.startsWith("payout_retry_") ||
-          key.startsWith("reveal_retry_") ||
-          key.startsWith("block_hash_waiting_") ||
-          key.startsWith("block_hash_action_") ||
-          key.startsWith("block_hash_start_")
-        ) {
-          keysToDelete.push(key);
-        }
-      }
-      keysToDelete.forEach((key) => lastWaitingLogs.delete(key));
-      break;
-
-    default:
-      log(`❓ Unknown game phase: ${gameState.phase}`, gameId);
-      break;
-  }
-}
-
-// ===========================
-// GAME SERVER MANAGEMENT
-// ===========================
-
+// Start game server for a specific game
 async function startGameServer(gameId) {
   try {
     log(`🚀 Starting game server for game ${gameId}...`, gameId);
 
-    // First check if the game is too old to start
-    const tooOld = await isGameTooOldToStart(gameId);
+    const tooOld = await isGameTooOldToStart(
+      gameId,
+      globalPublicClient,
+      globalContractAddress,
+      FULL_CONTRACT_ABI
+    );
     if (tooOld) {
       log(
         `⚠️ Game is too old to start - block hash no longer available`,
         gameId
       );
-      markGameAsExpired(gameId);
+      markGameAsExpired(gameId, gameStates, GamePhase);
       return false;
     }
 
-    // Double-check block hash availability before proceeding
-    const blockHashAvailable = await isBlockHashAvailable(gameId);
+    const blockHashAvailable = await isBlockHashAvailable(
+      gameId,
+      globalPublicClient,
+      globalContractAddress,
+      FULL_CONTRACT_ABI
+    );
     if (!blockHashAvailable) {
       log(`⚠️ Block hash not available for game - marking as expired`, gameId);
-      markGameAsExpired(gameId);
+      markGameAsExpired(gameId, gameStates, GamePhase);
       return false;
     }
 
-    // Check if game is already finished (has completed scores)
+    // Check if game is already finished
     let gameAlreadyFinished = false;
     try {
       const scoresFilePath = `${SAVED_DIR}/scores_${gameId}.txt`;
       if (fs.existsSync(scoresFilePath)) {
-        const scores = loadGameScores(gameId);
-        const allPlayersFinished = scores.every((p) => {
-          // Player is finished if:
-          // 1. No mines left (can't mine anymore), OR
-          // 2. No moves left AND standing on depleted tile (can't mine current square)
+        const scores = JSON.parse(fs.readFileSync(scoresFilePath, "utf8"));
+        const allPlayersFinished = scores.players.every((p) => {
           return (
             p.minesRemaining === 0 || (p.movesRemaining === 0 && p.tile === 0)
           );
@@ -1455,7 +118,6 @@ async function startGameServer(gameId) {
           gameAlreadyFinished = true;
           log(`🏁 Game already finished, keeping scores file`, gameId);
         } else {
-          // Game in progress, remove old scores to start fresh
           fs.unlinkSync(scoresFilePath);
           log(`🧹 Removed old scores file (game not finished)`, gameId);
         }
@@ -1467,301 +129,71 @@ async function startGameServer(gameId) {
       );
     }
 
-    // If game is already finished, don't start server
     if (gameAlreadyFinished) {
       log(`⏹️ Game ${gameId} already finished, not starting server`, gameId);
       return false;
     }
 
-    // Check if reveal file exists and load it
-    log(`🔍 Checking for reveal file...`, gameId);
-    let revealValue;
+    // Check if reveal file exists
     try {
-      revealValue = loadRevealValue(gameId);
+      const revealValue = loadRevealValue(gameId);
       log(`✅ Found reveal value: ${revealValue.substring(0, 10)}...`, gameId);
     } catch (revealError) {
       log(
         `❌ Cannot start server - missing reveal file: ${revealError.message}`,
         gameId
       );
-      log(
-        `💡 This suggests the commit phase was not completed successfully`,
-        gameId
-      );
       return false;
     }
 
-    // Get map size from contract
-    let contractMapSize;
-    let contractPlayers;
-    try {
-      const commitState = await globalPublicClient.readContract({
-        address: globalContractAddress,
-        abi: FULL_CONTRACT_ABI,
-        functionName: "getCommitRevealState",
-        args: [BigInt(gameId)],
-      });
+    // Get contract players and map size
+    const contractPlayers = await globalPublicClient.readContract({
+      address: globalContractAddress,
+      abi: FULL_CONTRACT_ABI,
+      functionName: "getPlayers",
+      args: [BigInt(gameId)],
+    });
 
-      const [, , , , hasCommitted, hasRevealed, mapSize] = commitState;
+    const gameState = gameStates.get(gameId);
+    const contractMapSize =
+      gameState && gameState.mapSize > 0
+        ? gameState.mapSize
+        : 1 + 4 * contractPlayers.length;
 
-      if (!hasCommitted) {
-        throw new Error("Hash not committed yet");
-      }
-
-      contractMapSize = Number(mapSize);
-
-      // Get player count to validate map size
-      contractPlayers = await globalPublicClient.readContract({
-        address: globalContractAddress,
-        abi: FULL_CONTRACT_ABI,
-        functionName: "getPlayers",
-        args: [BigInt(gameId)],
-      });
-
-      log(`🔍 Contract debugging:`, gameId);
-      log(`  - Raw mapSize from contract: ${contractMapSize}`, gameId);
-      log(`  - Player count from contract: ${contractPlayers.length}`, gameId);
-      log(`  - Players: ${JSON.stringify(contractPlayers)}`, gameId);
-
-      // Let's also check the full commit-reveal state for debugging
-      const fullCommitState = await globalPublicClient.readContract({
-        address: globalContractAddress,
-        abi: FULL_CONTRACT_ABI,
-        functionName: "getCommitRevealState",
-        args: [BigInt(gameId)],
-      });
-      log(
-        `  - Full commit state: hasCommitted=${fullCommitState[4]}, hasRevealed=${fullCommitState[5]}, hasStoredBlockHash=${fullCommitState[6]}, mapSize=${fullCommitState[7]}`,
-        gameId
-      );
-
-      // Also check game info to see if game is properly closed
-      const gameInfo = await globalPublicClient.readContract({
-        address: globalContractAddress,
-        abi: FULL_CONTRACT_ABI,
-        functionName: "getGameInfo",
-        args: [BigInt(gameId)],
-      });
-      log(
-        `  - Game info: hasOpened=${gameInfo[5]}, hasClosed=${gameInfo[6]}, open=${gameInfo[3]}, playerCount=${gameInfo[4]}`,
-        gameId
-      );
-
-      // Calculate expected map size: 1 + (MAP_MULTIPLIER × playerCount)
-      const expectedMapSize = 1 + MAP_MULTIPLIER * contractPlayers.length;
-      log(
-        `  - Expected map size calculation: 1 + (${MAP_MULTIPLIER} × ${contractPlayers.length}) = ${expectedMapSize}`,
-        gameId
-      );
-
-      // Check if contract returned the correct map size
-      if (contractMapSize <= 0 || contractMapSize !== expectedMapSize) {
-        if (contractMapSize > 0) {
-          log(
-            `⚠️ Contract returned incorrect map size: ${contractMapSize}, expected ${expectedMapSize} for ${contractPlayers.length} players`,
-            gameId
-          );
-        } else {
-          log(
-            `⚠️ Contract returned invalid map size: ${contractMapSize}, calculating manually`,
-            gameId
-          );
-        }
-
-        // Use the correct calculated size
-        contractMapSize = expectedMapSize;
-        log(
-          `🧮 Using correct map size: ${contractMapSize}x${contractMapSize} (${contractPlayers.length} players)`,
-          gameId
-        );
-      } else {
-        log(
-          `🗺️ Contract map size verified: ${contractMapSize}x${contractMapSize} (${contractPlayers.length} players)`,
-          gameId
-        );
-      }
-    } catch (contractError) {
-      log(
-        `❌ Error getting map size from contract: ${contractError.message}`,
-        gameId
-      );
-      return false;
-    }
-
-    // Ensure we have contractPlayers data
-    if (!contractPlayers) {
-      log(`❌ Failed to get player data from contract`, gameId);
-      return false;
-    }
-
-    // Log map generation
     log(`🎮 Generating map for ${contractPlayers.length} players...`, gameId);
 
-    // Calculate the randomHash - this is where the block hash issue might occur
-    let randomHash;
-    try {
-      randomHash = await calculateRandomHash(gameId, revealValue);
-      log(
-        `✅ Random hash calculated: ${randomHash.substring(0, 10)}...`,
-        gameId
-      );
-    } catch (randomHashError) {
-      log(
-        `❌ Failed to calculate random hash: ${randomHashError.message}`,
-        gameId
-      );
+    // Calculate random hash and generate map
+    const revealValue = loadRevealValue(gameId);
+    const randomHash = await calculateRandomHash(
+      gameId,
+      revealValue,
+      globalPublicClient,
+      globalContractAddress,
+      FULL_CONTRACT_ABI
+    );
 
-      // Check if this is a block hash availability error
-      if (
-        randomHashError.message.includes("Commit block hash not available") ||
-        randomHashError.message.includes("too old")
-      ) {
-        log(`⚠️ Block hash is too old - marking game as expired`, gameId);
-        markGameAsExpired(gameId);
-      } else {
-        log(
-          `💡 This suggests an issue with the reveal value or contract state`,
-          gameId
-        );
-      }
-      return false;
-    }
+    const dice = new DeterministicDice(randomHash);
+    const mapGenerator = new GameLandGenerator(dice, contractMapSize);
+    mapGenerator.generateLand();
+    mapGenerator.placeStartingPosition();
 
-    // Generate map using the calculated random hash
-    let mapData;
-    try {
-      log(`🎲 Starting map generation with randomHash: ${randomHash}`, gameId);
-      log(`📏 Target map size: ${contractMapSize}x${contractMapSize}`, gameId);
+    const mapData = {
+      size: mapGenerator.size,
+      land: mapGenerator.land,
+      startingPosition: mapGenerator.startingPosition,
+      metadata: {
+        generated: new Date().toISOString(),
+        gameId: gameId,
+        revealValue: revealValue,
+        randomHash: randomHash,
+      },
+    };
 
-      // Step 1: Initialize DeterministicDice
-      log(`🎲 Initializing DeterministicDice with randomHash...`, gameId);
-      const dice = new DeterministicDice(randomHash);
-      log(`✅ DeterministicDice initialized successfully`, gameId);
-
-      // Step 2: Initialize GameLandGenerator
-      log(
-        `🗺️ Initializing GameLandGenerator with size ${contractMapSize}...`,
-        gameId
-      );
-      const mapGenerator = new GameLandGenerator(dice, contractMapSize);
-      log(`✅ GameLandGenerator initialized`, gameId);
-      log(`📊 Generator initial state:`, gameId);
-      log(`  - Size: ${mapGenerator.size}`, gameId);
-      log(
-        `  - Land array length: ${
-          mapGenerator.land ? mapGenerator.land.length : "undefined"
-        }`,
-        gameId
-      );
-
-      // Step 3: Generate the land
-      log(`🌱 Calling generateLand()...`, gameId);
-      mapGenerator.generateLand();
-      log(`✅ generateLand() completed`, gameId);
-      log(`📊 After generateLand():`, gameId);
-      log(`  - Size: ${mapGenerator.size}`, gameId);
-      log(
-        `  - Land array length: ${
-          mapGenerator.land ? mapGenerator.land.length : "undefined"
-        }`,
-        gameId
-      );
-      if (mapGenerator.land && mapGenerator.land.length > 0) {
-        log(
-          `  - First row length: ${
-            mapGenerator.land[0] ? mapGenerator.land[0].length : "undefined"
-          }`,
-          gameId
-        );
-        log(
-          `  - Sample tiles from first row: ${
-            mapGenerator.land[0]
-              ? mapGenerator.land[0].slice(
-                  0,
-                  Math.min(5, mapGenerator.land[0].length)
-                )
-              : "undefined"
-          }`,
-          gameId
-        );
-      }
-
-      // Step 4: Place starting position
-      log(`📍 Calling placeStartingPosition()...`, gameId);
-      mapGenerator.placeStartingPosition();
-      log(`✅ placeStartingPosition() completed`, gameId);
-      log(`📊 After placeStartingPosition():`, gameId);
-      if (mapGenerator.startingPosition) {
-        log(
-          `  - Starting position: x=${mapGenerator.startingPosition.x}, y=${mapGenerator.startingPosition.y}`,
-          gameId
-        );
-        log(
-          `  - Original land type: ${mapGenerator.startingPosition.originalLandType}`,
-          gameId
-        );
-      } else {
-        log(`  - Starting position: undefined`, gameId);
-      }
-
-      // Step 5: Create final map data structure
-      log(`📦 Creating final map data structure...`, gameId);
-      mapData = {
-        size: mapGenerator.size,
-        land: mapGenerator.land,
-        startingPosition: mapGenerator.startingPosition,
-        metadata: {
-          generated: new Date().toISOString(),
-          gameId: gameId,
-          revealValue: revealValue,
-          randomHash: randomHash,
-        },
-      };
-
-      // Step 6: Detailed validation of final map
-      log(`🔍 Final map validation:`, gameId);
-      log(`  - Map size: ${mapData.size}x${mapData.size}`, gameId);
-      log(
-        `  - Land array dimensions: ${
-          mapData.land ? mapData.land.length : "undefined"
-        } x ${
-          mapData.land && mapData.land[0] ? mapData.land[0].length : "undefined"
-        }`,
-        gameId
-      );
-
-      if (mapData.land && mapData.land.length > 0) {
-        // Count tile types
-        const tileCounts = {};
-        for (let y = 0; y < mapData.land.length; y++) {
-          for (let x = 0; x < mapData.land[y].length; x++) {
-            const tile = mapData.land[y][x];
-            tileCounts[tile] = (tileCounts[tile] || 0) + 1;
-          }
-        }
-        log(`  - Tile distribution: ${JSON.stringify(tileCounts)}`, gameId);
-
-        // Show a sample of the map
-        log(`  - Map preview (first 3x3):`, gameId);
-        for (let y = 0; y < Math.min(3, mapData.land.length); y++) {
-          const row = [];
-          for (let x = 0; x < Math.min(3, mapData.land[y].length); x++) {
-            row.push(mapData.land[y][x]);
-          }
-          log(`    Row ${y}: [${row.join(", ")}]`, gameId);
-        }
-      }
-
-      saveGameMap(gameId, mapData);
-      log(
-        `✅ Map generated successfully: ${mapData.size}x${mapData.size}`,
-        gameId
-      );
-    } catch (mapError) {
-      log(`❌ Error generating map: ${mapError.message}`, gameId);
-      log(`📍 Map generation error stack: ${mapError.stack}`, gameId);
-      return false;
-    }
+    saveGameMap(gameId, mapData);
+    log(
+      `✅ Map generated successfully: ${mapData.size}x${mapData.size}`,
+      gameId
+    );
 
     // Stop current server if running
     if (activeGameServer) {
@@ -1769,22 +201,29 @@ async function startGameServer(gameId) {
       await stopGameServer();
     }
 
-    // Start new server for this game
-    log(`🌐 Initializing HTTP server...`, gameId);
-    const serverStarted = await initializeGameServer(gameId);
+    // Start new server
+    const serverResult = await initializeGameServer(
+      gameId,
+      globalPublicClient,
+      globalContractAddress
+    );
 
-    if (serverStarted) {
+    if (serverResult.server) {
       activeGameServer = gameId;
       currentGameId = gameId;
+      if (serverResult.isHTTPS) {
+        httpsServer = serverResult.server;
+      } else {
+        httpServer = serverResult.server;
+      }
+
       log(`✅ Game server started successfully for game ${gameId}!`, gameId);
       log(`🌍 Server accessible at http://localhost:8000`, gameId);
-      log(`🎮 Players can now access the game!`, gameId);
 
-      // Update game state to GAME_RUNNING
-      const gameState = gameStates.get(gameId);
-      if (gameState) {
-        gameState.phase = GamePhase.GAME_RUNNING;
-        gameStates.set(gameId, gameState);
+      const currentGameState = gameStates.get(gameId);
+      if (currentGameState) {
+        currentGameState.phase = GamePhase.GAME_RUNNING;
+        gameStates.set(gameId, currentGameState);
         log(`📊 Game phase updated to GAME_RUNNING`, gameId);
       }
       return true;
@@ -1796,19 +235,19 @@ async function startGameServer(gameId) {
     log(`❌ Error starting game server: ${error.message}`, gameId);
     log(`📍 Stack trace: ${error.stack}`, gameId);
 
-    // Check if this is a block hash related error
     if (
       error.message.includes("Commit block hash not available") ||
       error.message.includes("too old")
     ) {
       log(`⚠️ Block hash error detected - marking game as expired`, gameId);
-      markGameAsExpired(gameId);
+      markGameAsExpired(gameId, gameStates, GamePhase);
     }
 
     return false;
   }
 }
 
+// Stop game server
 async function stopGameServer() {
   if (httpServer) {
     httpServer.close();
@@ -1819,14 +258,10 @@ async function stopGameServer() {
     httpsServer = null;
   }
 
-  // Clear game timer
-  if (gameTimerInterval) {
-    clearTimeout(gameTimerInterval);
-    gameTimerInterval = null;
-  }
-  gameStartTime = null;
+  // Clean up game server state
+  cleanupGameServer();
 
-  // Clean up timer warning keys and retry log keys when stopping server
+  // Clean up timer warning keys
   const keysToDelete = [];
   for (const [key, value] of lastWaitingLogs.entries()) {
     if (
@@ -1842,7 +277,6 @@ async function stopGameServer() {
   }
   keysToDelete.forEach((key) => lastWaitingLogs.delete(key));
 
-  // Clean up any retry tracking for the current game
   if (activeGameServer) {
     revealRetryCount.delete(activeGameServer);
     revealLastRetryTime.delete(activeGameServer);
@@ -1855,1052 +289,41 @@ async function stopGameServer() {
   }
 }
 
-async function monitorGameProgress(gameId) {
-  try {
-    // Only monitor if this game's server is running
-    if (activeGameServer !== gameId) {
-      log(`⚠️ Cannot monitor - server not running for this game`, gameId);
-      return;
-    }
-
-    // Check if timer has expired
-    const timeRemaining = getTimeRemaining();
-    if (timeRemaining <= 0 && gameStartTime !== null) {
-      log(`⏰ Timer expired! Force finishing game...`, gameId);
-      forceFinishGameOnTimer(gameId);
-    } else if (gameStartTime !== null) {
-      // Log timer warnings at key intervals (but only once per warning)
-      const warningTimes = [60, 30, 10, 5];
-      const currentTime = Math.floor(timeRemaining);
-
-      if (warningTimes.includes(currentTime)) {
-        // Only log if we haven't logged this warning yet (avoid spam)
-        const warningKey = `timer_warning_${currentTime}`;
-        if (!lastWaitingLogs.has(warningKey)) {
-          log(`⏰ Timer warning: ${currentTime} seconds remaining!`, gameId);
-          lastWaitingLogs.set(warningKey, Date.now());
-        }
-      }
-    }
-
-    // Check if all players have finished
-    const playerData = getCurrentPlayerData(gameId);
-
-    if (playerData.length === 0) {
-      log(`⚠️ No player data available yet`, gameId);
-      return;
-    }
-
-    const allPlayersFinished = playerData.every((p) => {
-      // Player is finished if:
-      // 1. No mines left (can't mine anymore), OR
-      // 2. No moves left AND standing on depleted tile (can't mine current square)
-      return p.minesRemaining === 0 || (p.movesRemaining === 0 && p.tile === 0);
-    });
-
-    if (allPlayersFinished) {
-      log(`🏁 All players finished! Saving final scores...`, gameId);
-
-      // Log final player stats
-      log(`📊 Final Results:`, gameId);
-      playerData.forEach((player, index) => {
-        log(`  Player ${index + 1}: ${player.address}`, gameId);
-        log(
-          `    Score: ${player.score}, Moves: ${player.movesRemaining}, Mines: ${player.minesRemaining}, Current tile: ${player.tile}`,
-          gameId
-        );
-      });
-
-      saveGameScores(gameId, playerData);
-
-      // Clear the timer since game is finished
-      if (gameTimerInterval) {
-        clearInterval(gameTimerInterval);
-        gameTimerInterval = null;
-      }
-
-      // Keep server running for now - will stop it later after payout/reveal
-      log(`🌐 Keeping game server running for payout/reveal phase...`, gameId);
-
-      // Update game state
-      const currentMonitoringGameState = gameStates.get(gameId);
-      if (currentMonitoringGameState) {
-        currentMonitoringGameState.phase = GamePhase.GAME_FINISHED;
-        gameStates.set(gameId, currentMonitoringGameState);
-        log(`📊 Game phase updated to GAME_FINISHED`, gameId);
-      }
-
-      log(`✅ Game completed, ready for payout`, gameId);
-    }
-    // Don't log "Game still in progress" every 3 seconds - too noisy
-  } catch (error) {
-    log(`❌ Error monitoring game progress: ${error.message}`, gameId);
-    log(`📍 Stack trace: ${error.stack}`, gameId);
-  }
-}
-
-// ===========================
-// EVENT LISTENING & GAME DISCOVERY
-// ===========================
-
-async function scanForExistingGames() {
-  try {
-    log(`🔍 Scanning for existing games where we are gamemaster...`);
-
-    // Get all GameCreated events from the beginning
-    const gameCreatedEvents = await globalPublicClient.getContractEvents({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      eventName: "GameCreated",
-      args: {
-        gamemaster: globalAccount.address,
-      },
-      fromBlock: 0n,
-      toBlock: "latest",
-    });
-
-    log(`📋 Found ${gameCreatedEvents.length} existing games`);
-
-    // Process each game
-    for (const event of gameCreatedEvents) {
-      const gameId = event.args.gameId.toString();
-      const gamemaster = event.args.gamemaster;
-      const creator = event.args.creator;
-      const stakeAmount = event.args.stakeAmount;
-
-      log(`📋 Processing existing game ${gameId}`, gameId);
-      log(`  Gamemaster: ${gamemaster}`, gameId);
-      log(`  Creator: ${creator}`, gameId);
-      log(`  Stake: ${Number(stakeAmount) / 1e18} ETH`, gameId);
-
-      // Add to our managed games
-      gameStates.set(gameId, {
-        gameId,
-        gamemaster,
-        creator,
-        stakeAmount,
-        phase: GamePhase.CREATED, // Will be updated when we check state
-        lastUpdated: Date.now(),
-      });
-    }
-
-    log(`✅ Scanned and loaded ${gameCreatedEvents.length} existing games`);
-    return gameCreatedEvents.length;
-  } catch (error) {
-    log(`❌ Error scanning for existing games: ${error.message}`);
-    return 0;
-  }
-}
-
-async function setupEventListeners() {
-  try {
-    log(`📡 Setting up event listeners...`);
-    log(
-      `🎯 Listening for games where we are gamemaster: ${globalAccount.address}`
-    );
-
-    // Listen for GameCreated events (new games)
-    const unsubscribeGameCreated = globalPublicClient.watchContractEvent({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      eventName: "GameCreated",
-      args: {
-        gamemaster: globalAccount.address,
-      },
-      onLogs: (logs) => {
-        logs.forEach((eventLog) => {
-          const gameId = eventLog.args.gameId.toString();
-          const gamemaster = eventLog.args.gamemaster;
-          const creator = eventLog.args.creator;
-          const stakeAmount = eventLog.args.stakeAmount;
-
-          log(`🎮 NEW game created! Game ID: ${gameId}`, gameId);
-          log(`  Gamemaster: ${gamemaster}`, gameId);
-          log(`  Creator: ${creator}`, gameId);
-          log(`  Stake: ${Number(stakeAmount) / 1e18} ETH`, gameId);
-
-          // Add to our managed games
-          gameStates.set(gameId, {
-            gameId,
-            gamemaster,
-            creator,
-            stakeAmount,
-            phase: GamePhase.CREATED,
-            lastUpdated: Date.now(),
-          });
-        });
-      },
-    });
-
-    // Listen for GameClosed events
-    const unsubscribeGameClosed = globalPublicClient.watchContractEvent({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      eventName: "GameClosed",
-      onLogs: (logs) => {
-        logs.forEach((eventLog) => {
-          const gameId = eventLog.args.gameId.toString();
-          const startTime = eventLog.args.startTime;
-          const mapSize = eventLog.args.mapSize;
-          const eventGameState = gameStates.get(gameId);
-
-          if (eventGameState) {
-            log(`🔒 Game closed! Game ID: ${gameId}`, gameId);
-            log(`📐 Map size calculated: ${mapSize}x${mapSize}`, gameId);
-            log(
-              `⏰ Game start time: ${new Date(
-                Number(startTime) * 1000
-              ).toISOString()}`,
-              gameId
-            );
-            eventGameState.phase = GamePhase.CLOSED;
-            eventGameState.mapSize = Number(mapSize);
-            eventGameState.lastUpdated = Date.now();
-            gameStates.set(gameId, eventGameState);
-          }
-        });
-      },
-    });
-
-    // Listen for HashCommitted events (to track our commits)
-    const unsubscribeHashCommitted = globalPublicClient.watchContractEvent({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      eventName: "HashCommitted",
-      onLogs: (logs) => {
-        logs.forEach((eventLog) => {
-          const gameId = eventLog.args.gameId.toString();
-          const commitGameState = gameStates.get(gameId);
-
-          if (commitGameState) {
-            log(`📝 Hash committed for game ${gameId}`, gameId);
-            commitGameState.phase = GamePhase.COMMITTED;
-            commitGameState.lastUpdated = Date.now();
-            gameStates.set(gameId, commitGameState);
-          }
-        });
-      },
-    });
-
-    // Listen for GameOpened events (when game becomes open for players)
-    const unsubscribeGameOpened = globalPublicClient.watchContractEvent({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      eventName: "GameOpened",
-      onLogs: (logs) => {
-        logs.forEach((eventLog) => {
-          const gameId = eventLog.args.gameId.toString();
-          const openGameState = gameStates.get(gameId);
-
-          if (openGameState) {
-            log(`🔓 Game opened for players! Game ID: ${gameId}`, gameId);
-            log(`👥 Players can now join the game`, gameId);
-            // Keep the COMMITTED phase since the game is waiting to be closed
-            openGameState.lastUpdated = Date.now();
-            gameStates.set(gameId, openGameState);
-          }
-        });
-      },
-    });
-
-    log(`✅ Event listeners set up successfully`);
-    return [
-      unsubscribeGameCreated,
-      unsubscribeGameClosed,
-      unsubscribeHashCommitted,
-      unsubscribeGameOpened,
-    ];
-  } catch (error) {
-    log(`❌ Error setting up event listeners: ${error.message}`);
-    return [];
-  }
-}
-
-// ===========================
-// GAME SERVER LOGIC
-// ===========================
-
-const app = express();
-
-// JWT Configuration
-const BASE_JWT_SECRET =
-  process.env.JWT_SECRET || "your-secret-key-change-this-in-production";
-const JWT_EXPIRES_IN = "1h";
-
-// Game server state
-let gameMap = null;
-let players = [];
-let playerPositions = new Map();
-let playerStats = new Map();
-let revealSeed = null;
-
-// Timer state
-let gameStartTime = null;
-let gameTimerDuration = 90; // 90 seconds
-let gameTimerInterval = null;
-
-// Game constants
-const MAP_MULTIPLIER = 4;
-const MAX_MOVES = 12;
-const MAX_MINES = 3;
-const TILE_POINTS = {
-  0: 0, // Depleted
-  1: 1, // Common
-  2: 5, // Uncommon
-  3: 10, // Rare
-  X: 25, // Starting position (ultra rare)
-};
-
-const DIRECTIONS = {
-  north: { x: 0, y: -1 },
-  south: { x: 0, y: 1 },
-  east: { x: 1, y: 0 },
-  west: { x: -1, y: 0 },
-  northeast: { x: 1, y: -1 },
-  northwest: { x: -1, y: -1 },
-  southeast: { x: 1, y: 1 },
-  southwest: { x: -1, y: 1 },
-};
-
-// Helper functions
-function getJWTSecret() {
-  if (!globalContractAddress) {
-    throw new Error("Contract address not initialized");
-  }
-  return BASE_JWT_SECRET + "-" + globalContractAddress.toLowerCase();
-}
-
-function generateSignMessage(gameId, providedTimestamp = null) {
-  const timestamp = providedTimestamp || Date.now();
-  return `Sign this message to authenticate with the game server.\n\nContract: ${globalContractAddress}\nGameId: ${gameId}\nNamespace: ScriptGame\nTimestamp: ${timestamp}\n\nThis signature is valid for 5 minutes.`;
-}
-
-function isValidPlayer(address) {
-  return players.some(
-    (player) => player.toLowerCase() === address.toLowerCase()
-  );
-}
-
-function getCurrentMapSize() {
-  // If we have a loaded game map, use its size
-  if (gameMap && gameMap.size) {
-    return gameMap.size;
-  }
-
-  // If we have a current game ID, try to get map size from contract
-  if (currentGameId) {
-    const gameState = gameStates.get(currentGameId);
-    if (gameState && gameState.mapSize > 0) {
-      return gameState.mapSize;
-    }
-  }
-
-  // Otherwise calculate based on current player count
-  const playerCount = players.length;
-  return playerCount > 0 ? 1 + MAP_MULTIPLIER * playerCount : 5; // Minimum 5x5
-}
-
-function wrapCoordinate(coord, mapSize = null) {
-  const size = mapSize || getCurrentMapSize();
-  const result = ((coord % size) + size) % size;
-  return result;
-}
-
-// Player positioning now handled by PlayerPositionGenerator from generateMap.js
-
-function getCurrentPlayerData(gameId) {
-  const playerData = [];
-  players.forEach((address) => {
-    const position = playerPositions.get(address.toLowerCase());
-    const stats = playerStats.get(address.toLowerCase());
-    if (position && stats) {
-      // Ensure position is within map bounds with wrapping
-      const wrappedX = wrapCoordinate(position.x, gameMap?.size);
-      const wrappedY = wrapCoordinate(position.y, gameMap?.size);
-
-      // Get tile value safely
-      let tile = 0; // Default to depleted if map access fails
-      if (
-        gameMap &&
-        gameMap.land &&
-        gameMap.land[wrappedY] &&
-        gameMap.land[wrappedY][wrappedX] !== undefined
-      ) {
-        tile = gameMap.land[wrappedY][wrappedX];
-      }
-
-      playerData.push({
-        address,
-        position: { x: wrappedX, y: wrappedY }, // Use wrapped coordinates
-        tile,
-        score: stats.score,
-        movesRemaining: stats.movesRemaining,
-        minesRemaining: stats.minesRemaining,
-      });
-    }
-  });
-  return playerData;
-}
-
-function getSanitizedPlayerData(gameId) {
-  const playerData = [];
-  players.forEach((address) => {
-    const stats = playerStats.get(address.toLowerCase());
-    if (stats) {
-      playerData.push({
-        address,
-        score: stats.score,
-        movesRemaining: stats.movesRemaining,
-        minesRemaining: stats.minesRemaining,
-      });
-    }
-  });
-  return playerData;
-}
-
-function getTimeRemaining() {
-  if (!gameStartTime) return 0;
-  const elapsed = Math.floor((Date.now() - gameStartTime) / 1000);
-  return Math.max(0, gameTimerDuration - elapsed);
-}
-
-function forceFinishGameOnTimer(gameId) {
-  log(`⏰ Timer expired! Force finishing game ${gameId}...`, gameId);
-
-  // Log current player stats before forcing finish
+// Monitor game progress wrapper
+async function monitorGameProgressWrapper(gameId) {
   const playerData = getCurrentPlayerData(gameId);
-  log(`📊 Game ending due to timer - Current player stats:`, gameId);
-  playerData.forEach((player, index) => {
-    log(`  Player ${index + 1}: ${player.address}`, gameId);
-    log(
-      `    Score: ${player.score}, Moves: ${player.movesRemaining}, Mines: ${player.minesRemaining}`,
-      gameId
-    );
+
+  if (playerData.length === 0) {
+    log(`⚠️ No player data available yet`, gameId);
+    return;
+  }
+
+  const allPlayersFinished = playerData.every((p) => {
+    return p.minesRemaining === 0 || (p.movesRemaining === 0 && p.tile === 0);
   });
 
-  // Set all players' moves and mines to 0
-  players.forEach((address) => {
-    const stats = playerStats.get(address.toLowerCase());
-    if (stats) {
-      stats.movesRemaining = 0;
-      stats.minesRemaining = 0;
-      playerStats.set(address.toLowerCase(), stats);
+  if (allPlayersFinished) {
+    log(`🏁 All players finished! Saving final scores...`, gameId);
+    saveGameScores(gameId, playerData);
+
+    const currentMonitoringGameState = gameStates.get(gameId);
+    if (currentMonitoringGameState) {
+      currentMonitoringGameState.phase = GamePhase.GAME_FINISHED;
+      gameStates.set(gameId, currentMonitoringGameState);
+      log(`📊 Game phase updated to GAME_FINISHED`, gameId);
     }
-  });
+  }
 
-  log(
-    `🏁 All players' moves and mines set to 0 due to timer expiration`,
-    gameId
+  // Call the generic monitor function
+  await monitorGameProgress(
+    gameId,
+    activeGameServer,
+    gameStates,
+    lastWaitingLogs
   );
-
-  // Clear the timer
-  if (gameTimerInterval) {
-    clearTimeout(gameTimerInterval);
-    gameTimerInterval = null;
-  }
-
-  // The game will be detected as finished in the next monitoring cycle
 }
 
-async function loadPlayersFromContract(gameId) {
-  try {
-    const contractPlayers = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getPlayers",
-      args: [BigInt(gameId)],
-    });
-
-    players = contractPlayers;
-    playerPositions.clear();
-    playerStats.clear();
-
-    // Get map size from contract
-    const gameState = gameStates.get(gameId);
-    const mapSize =
-      gameState && gameState.mapSize > 0
-        ? gameState.mapSize
-        : getCurrentMapSize();
-
-    // Generate player positions using the PlayerPositionGenerator
-    const playerPositionGenerator = new PlayerPositionGenerator(revealSeed);
-
-    contractPlayers.forEach((playerAddress) => {
-      const startPos = playerPositionGenerator.generateStartingPosition(
-        playerAddress,
-        gameId,
-        mapSize
-      );
-
-      // Ensure position is within map bounds
-      const wrappedPos = {
-        x: wrapCoordinate(startPos.x, mapSize),
-        y: wrapCoordinate(startPos.y, mapSize),
-      };
-
-      playerPositions.set(playerAddress.toLowerCase(), wrappedPos);
-      playerStats.set(playerAddress.toLowerCase(), {
-        score: 0,
-        movesRemaining: MAX_MOVES,
-        minesRemaining: MAX_MINES,
-      });
-    });
-
-    log(`Loaded ${contractPlayers.length} players from contract`, gameId);
-    return true;
-  } catch (error) {
-    log(`Error loading players: ${error.message}`, gameId);
-    return false;
-  }
-}
-
-// Express middleware
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
-  );
-  if (req.method === "OPTIONS") {
-    res.sendStatus(200);
-  } else {
-    next();
-  }
-});
-
-app.use(express.json());
-
-// Override Express JSON response to handle BigInt values
-app.set("json replacer", function (key, value) {
-  if (typeof value === "bigint") {
-    return Number(value);
-  }
-  return value;
-});
-
-// Authentication middleware
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
-
-  if (!token) {
-    return res.status(401).json({ error: "Access token required" });
-  }
-
-  jwt.verify(token, getJWTSecret(), (err, decoded) => {
-    if (err) {
-      return res.status(403).json({ error: "Invalid or expired token" });
-    }
-
-    if (!isValidPlayer(decoded.address)) {
-      return res.status(403).json({ error: "Player no longer registered" });
-    }
-
-    req.playerAddress = decoded.address;
-
-    next();
-  });
-}
-
-// Game logic functions
-function getLocalMapView(playerAddress) {
-  const position = playerPositions.get(playerAddress.toLowerCase());
-  if (!position) {
-    return null;
-  }
-
-  const localView = [];
-  const { x: centerX, y: centerY } = position;
-
-  for (let dy = -1; dy <= 1; dy++) {
-    const row = [];
-    for (let dx = -1; dx <= 1; dx++) {
-      const mapX = wrapCoordinate(centerX + dx, gameMap.size);
-      const mapY = wrapCoordinate(centerY + dy, gameMap.size);
-      const tile = gameMap.land[mapY][mapX];
-
-      if (dx === 0 && dy === 0) {
-        row.push({ tile, player: true, coordinates: { x: mapX, y: mapY } });
-      } else {
-        row.push({ tile, player: false, coordinates: { x: mapX, y: mapY } });
-      }
-    }
-    localView.push(row);
-  }
-
-  return { view: localView, position };
-}
-
-function movePlayer(playerAddress, direction) {
-  const currentPos = playerPositions.get(playerAddress.toLowerCase());
-  if (!currentPos) {
-    return { success: false, error: "Player not found" };
-  }
-
-  const stats = playerStats.get(playerAddress.toLowerCase());
-  if (!stats) {
-    return { success: false, error: "Player stats not found" };
-  }
-
-  if (stats.movesRemaining <= 0)
-    return { success: false, error: "No moves remaining" };
-
-  // Simple validation - prevent crashes and ensure valid direction
-  if (typeof direction !== "string") {
-    return { success: false, error: "Direction must be a string" };
-  }
-
-  const normalizedDirection = direction.toLowerCase().trim();
-  const dirVector = DIRECTIONS[normalizedDirection];
-  if (!dirVector) {
-    return { success: false, error: "Invalid direction" };
-  }
-
-  const newX = wrapCoordinate(currentPos.x + dirVector.x, gameMap.size);
-  const newY = wrapCoordinate(currentPos.y + dirVector.y, gameMap.size);
-
-  playerPositions.set(playerAddress.toLowerCase(), { x: newX, y: newY });
-  stats.movesRemaining--;
-  playerStats.set(playerAddress.toLowerCase(), stats);
-
-  const result = {
-    success: true,
-    newPosition: { x: newX, y: newY },
-    tile: gameMap.land[newY][newX],
-    movesRemaining: stats.movesRemaining,
-    minesRemaining: stats.minesRemaining,
-    score: stats.score,
-  };
-
-  return result;
-}
-
-function minePlayer(playerAddress) {
-  const currentPos = playerPositions.get(playerAddress.toLowerCase());
-  if (!currentPos) {
-    return { success: false, error: "Player not found" };
-  }
-
-  const stats = playerStats.get(playerAddress.toLowerCase());
-  if (!stats) {
-    return { success: false, error: "Player stats not found" };
-  }
-
-  if (stats.minesRemaining <= 0)
-    return { success: false, error: "No mines remaining" };
-
-  const currentTile = gameMap.land[currentPos.y][currentPos.x];
-  if (currentTile === 0) return { success: false, error: "Tile already mined" };
-
-  const pointsEarned = TILE_POINTS[currentTile] || 0;
-  stats.score += pointsEarned;
-  stats.minesRemaining--;
-  playerStats.set(playerAddress.toLowerCase(), stats);
-
-  gameMap.land[currentPos.y][currentPos.x] = 0;
-
-  const result = {
-    success: true,
-    position: currentPos,
-    tile: currentTile,
-    pointsEarned,
-    totalScore: stats.score,
-    minesRemaining: stats.minesRemaining,
-    movesRemaining: stats.movesRemaining,
-  };
-
-  return result;
-}
-
-// API Routes
-app.get("/", (req, res) => {
-  const timeRemaining = getTimeRemaining();
-  const gameActive = gameStartTime !== null;
-
-  res.json({
-    success: true,
-    message: "Automated Game Server",
-    version: "2.0.0",
-    gameId: currentGameId,
-    activeGames: safeJsonConvert(Array.from(gameStates.keys())),
-    serverStatus: "running",
-    playerCount: players.length,
-    timestamp: new Date().toISOString(),
-    timer: {
-      active: gameActive,
-      duration: gameTimerDuration,
-      timeRemaining: timeRemaining,
-    },
-    endpoints: {
-      register: "/register",
-      map: "/map (requires auth)",
-      move: "/move (requires auth)",
-      mine: "/mine (requires auth)",
-      status: "/status",
-      players: "/players",
-      test: "/test",
-    },
-  });
-});
-
-// Test endpoint to verify server is working
-app.get("/test", (req, res) => {
-  res.json({
-    success: true,
-    message: "Server is running!",
-    gameId: currentGameId,
-    timestamp: new Date().toISOString(),
-    gameLoaded: gameMap !== null,
-    playersCount: players.length,
-  });
-});
-
-app.get("/register", (req, res) => {
-  const timestamp = Date.now();
-  const message = generateSignMessage(currentGameId, timestamp);
-
-  res.json({
-    success: true,
-    message,
-    timestamp,
-    gameId: currentGameId,
-    instructions: "Sign this message with your Ethereum wallet to authenticate",
-  });
-});
-
-app.post("/register", async (req, res) => {
-  const { signature, address, timestamp } = req.body;
-
-  if (!signature || !address || !timestamp) {
-    return res.status(400).json({
-      error: "Signature, address, and timestamp are required",
-    });
-  }
-
-  if (!isValidPlayer(address)) {
-    return res.status(403).json({
-      error: "Address is not registered as a player",
-    });
-  }
-
-  try {
-    const message = generateSignMessage(currentGameId, parseInt(timestamp));
-    const isValid = await verifyMessage({
-      address,
-      message,
-      signature,
-    });
-
-    if (!isValid) {
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-
-    const tokenPayload = {
-      address: address.toLowerCase(),
-      timestamp: Date.now(),
-    };
-
-    const token = jwt.sign(tokenPayload, getJWTSecret(), {
-      expiresIn: JWT_EXPIRES_IN,
-    });
-
-    res.json({
-      success: true,
-      token,
-      expiresIn: JWT_EXPIRES_IN,
-      message: "Authentication successful",
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to verify signature" });
-  }
-});
-
-app.get("/map", authenticateToken, (req, res) => {
-  const localView = getLocalMapView(req.playerAddress);
-  if (!localView) {
-    return res.status(404).json({ error: "Player not found" });
-  }
-
-  const stats = playerStats.get(req.playerAddress.toLowerCase());
-  const timeRemaining = getTimeRemaining();
-
-  const response = {
-    success: true,
-    player: req.playerAddress,
-    localView: localView.view,
-    position: localView.position,
-    score: stats ? stats.score : 0,
-    movesRemaining: stats ? stats.movesRemaining : 0,
-    minesRemaining: stats ? stats.minesRemaining : 0,
-    timeRemaining: timeRemaining,
-    legend: {
-      0: "Depleted (already mined)",
-      1: "Common (1 point)",
-      2: "Uncommon (5 points)",
-      3: "Rare (10 points)",
-      X: "Treasure!!! (25 points)",
-    },
-  };
-
-  res.json(response);
-});
-
-app.post("/move", authenticateToken, (req, res) => {
-  const { direction } = req.body;
-
-  if (!direction) {
-    return res.status(400).json({ error: "Direction required" });
-  }
-
-  const timeRemaining = getTimeRemaining();
-  if (timeRemaining <= 0) {
-    return res.status(400).json({ error: "Time expired! Game over." });
-  }
-
-  const moveResult = movePlayer(req.playerAddress, direction);
-  if (!moveResult.success) {
-    return res.status(400).json({ error: moveResult.error });
-  }
-
-  const localView = getLocalMapView(req.playerAddress);
-
-  const response = {
-    success: true,
-    player: req.playerAddress,
-    direction,
-    newPosition: moveResult.newPosition,
-    tile: moveResult.tile,
-    localView: localView.view,
-    score: moveResult.score,
-    movesRemaining: moveResult.movesRemaining,
-    minesRemaining: moveResult.minesRemaining,
-    timeRemaining: timeRemaining,
-    validDirections: Object.keys(DIRECTIONS),
-  };
-
-  res.json(response);
-});
-
-app.post("/mine", authenticateToken, (req, res) => {
-  const timeRemaining = getTimeRemaining();
-  if (timeRemaining <= 0) {
-    return res.status(400).json({ error: "Time expired! Game over." });
-  }
-
-  const mineResult = minePlayer(req.playerAddress);
-  if (!mineResult.success) {
-    return res.status(400).json({ error: mineResult.error });
-  }
-
-  const localView = getLocalMapView(req.playerAddress);
-
-  const response = {
-    success: true,
-    player: req.playerAddress,
-    position: mineResult.position,
-    tile: mineResult.tile,
-    pointsEarned: mineResult.pointsEarned,
-    totalScore: mineResult.totalScore,
-    movesRemaining: mineResult.movesRemaining,
-    minesRemaining: mineResult.minesRemaining,
-    timeRemaining: timeRemaining,
-    localView: localView.view,
-  };
-
-  res.json(response);
-});
-
-app.get("/status", (req, res) => {
-  const timeRemaining = getTimeRemaining();
-  const gameActive = gameStartTime !== null;
-
-  // Get retry information for debugging
-  const retryInfo = {};
-  for (const [gameId, count] of payoutRetryCount.entries()) {
-    const lastRetry = payoutLastRetryTime.get(gameId) || 0;
-    const now = Date.now();
-    const backoffMs = Math.min(5000 * Math.pow(2, count - 1), 300000);
-    const timeUntilRetry = Math.max(0, backoffMs - (now - lastRetry));
-
-    retryInfo[gameId] = {
-      type: "payout",
-      retryCount: count,
-      maxRetries: 10,
-      timeUntilRetry: Math.round(timeUntilRetry / 1000),
-      lastRetryTime: new Date(lastRetry).toISOString(),
-    };
-  }
-
-  // Add reveal retry information
-  for (const [gameId, count] of revealRetryCount.entries()) {
-    const lastRetry = revealLastRetryTime.get(gameId) || 0;
-    const now = Date.now();
-    const backoffMs = Math.min(30000 * Math.pow(2, count - 1), 300000);
-    const timeUntilRetry = Math.max(0, backoffMs - (now - lastRetry));
-
-    retryInfo[gameId] = {
-      type: "reveal",
-      retryCount: count,
-      maxRetries: 5,
-      timeUntilRetry: Math.round(timeUntilRetry / 1000),
-      lastRetryTime: new Date(lastRetry).toISOString(),
-    };
-  }
-
-  // Convert game states to safe JSON format (handling BigInt values)
-  const safeGameStates = Object.fromEntries(
-    Array.from(gameStates.entries()).map(([id, state]) => [
-      id,
-      safeJsonConvert({
-        phase: state.phase,
-        payoutSkipped: state.payoutSkipped || false,
-        playerCount: state.playerCount,
-        stakeAmount: state.stakeAmount,
-        hasOpened: state.hasOpened,
-        hasClosed: state.hasClosed,
-        hasCommitted: state.hasCommitted,
-        hasStoredBlockHash: state.hasStoredBlockHash,
-        hasRevealed: state.hasRevealed,
-        hasPaidOut: state.hasPaidOut,
-        mapSize: state.mapSize || 0,
-      }),
-    ])
-  );
-
-  res.json({
-    success: true,
-    gameId: currentGameId,
-    activeGames: Array.from(gameStates.keys()),
-    gameLoaded: gameMap !== null,
-    totalPlayers: players.length,
-    players,
-    serverTime: new Date().toISOString(),
-    timer: {
-      active: gameActive,
-      duration: gameTimerDuration,
-      timeRemaining: timeRemaining,
-      timeElapsed: gameActive ? gameTimerDuration - timeRemaining : 0,
-      startTime: gameStartTime,
-    },
-    retryInfo: retryInfo,
-    gameStates: safeGameStates,
-  });
-});
-
-app.get("/players", (req, res) => {
-  const playerData = getSanitizedPlayerData(currentGameId);
-  const timeRemaining = getTimeRemaining();
-
-  res.json({
-    success: true,
-    gameId: currentGameId,
-    players: playerData,
-    count: playerData.length,
-    timeRemaining: timeRemaining,
-  });
-});
-
-async function initializeGameServer(gameId) {
-  try {
-    log(`🔧 Initializing game server for game ${gameId}...`, gameId);
-
-    // Load game data
-    log(`📂 Loading game map...`, gameId);
-    gameMap = loadGameMap(gameId);
-    log(`✅ Game map loaded: ${gameMap.size}x${gameMap.size}`, gameId);
-
-    log(`🔑 Loading reveal value and calculating random hash...`, gameId);
-    const revealValue = loadRevealValue(gameId);
-    revealSeed = await calculateRandomHash(gameId, revealValue);
-    log(`✅ Random hash calculated: ${revealSeed.substring(0, 10)}...`, gameId);
-
-    // Load players
-    log(`👥 Loading players from contract...`, gameId);
-    const playersLoaded = await loadPlayersFromContract(gameId);
-    if (!playersLoaded) {
-      log(`❌ Failed to load players from contract`, gameId);
-      return false;
-    }
-    log(`✅ Loaded ${players.length} players`, gameId);
-
-    // Start the game timer
-    gameStartTime = Date.now();
-    log(
-      `⏰ Game timer started - players have ${gameTimerDuration} seconds`,
-      gameId
-    );
-
-    // Set up timer to force finish game after duration
-    gameTimerInterval = setTimeout(() => {
-      if (activeGameServer === gameId) {
-        log(`⏰ Timer expired! Auto-finishing game ${gameId}`, gameId);
-        forceFinishGameOnTimer(gameId);
-      }
-    }, gameTimerDuration * 1000);
-
-    // Start server
-    const PORT = 8000;
-    const hasSSL = fs.existsSync("server.key") && fs.existsSync("server.cert");
-    log(`🔒 SSL available: ${hasSSL}`, gameId);
-
-    return new Promise((resolve) => {
-      if (hasSSL) {
-        try {
-          log(`🔐 Setting up HTTPS server...`, gameId);
-          const httpsOptions = {
-            key: fs.readFileSync("server.key"),
-            cert: fs.readFileSync("server.cert"),
-          };
-          httpsServer = https.createServer(httpsOptions, app);
-          httpsServer.listen(PORT, "0.0.0.0", () => {
-            log(`🚀 HTTPS Game Server running on port ${PORT}`, gameId);
-            log(`🌍 Access at: https://localhost:${PORT}`, gameId);
-            resolve(true);
-          });
-          httpsServer.on("error", (error) => {
-            log(`❌ HTTPS server error: ${error.message}`, gameId);
-            resolve(false);
-          });
-        } catch (error) {
-          log(
-            `❌ SSL setup failed, falling back to HTTP: ${error.message}`,
-            gameId
-          );
-          httpServer = app.listen(PORT, "0.0.0.0", () => {
-            log(`🚀 HTTP Game Server running on port ${PORT}`, gameId);
-            log(`🌍 Access at: http://localhost:${PORT}`, gameId);
-            resolve(true);
-          });
-          httpServer.on("error", (error) => {
-            log(`❌ HTTP server error: ${error.message}`, gameId);
-            resolve(false);
-          });
-        }
-      } else {
-        log(`🌐 Setting up HTTP server...`, gameId);
-        httpServer = app.listen(PORT, "0.0.0.0", () => {
-          log(`🚀 HTTP Game Server running on port ${PORT}`, gameId);
-          log(`🌍 Access at: http://localhost:${PORT}`, gameId);
-          resolve(true);
-        });
-        httpServer.on("error", (error) => {
-          log(`❌ HTTP server error: ${error.message}`, gameId);
-          resolve(false);
-        });
-      }
-    });
-  } catch (error) {
-    log(`❌ Error initializing game server: ${error.message}`, gameId);
-    log(`📍 Stack trace: ${error.stack}`, gameId);
-    return false;
-  }
-}
-
-// ===========================
-// MAIN SYSTEM LOOP
-// ===========================
-
+// Main game loop
 async function gameLoop() {
   log(`🔄 Starting game processing loop...`);
 
@@ -2910,11 +333,9 @@ async function gameLoop() {
 
   while (true) {
     try {
-      // Process all active games
       const gameIds = Array.from(gameStates.keys());
 
       if (gameIds.length > 0) {
-        // Only log processing info occasionally or when count changes
         if (gameIds.length !== lastGameCount || quietCycles > 40) {
           const completedSummary =
             completedGamesCount > 0
@@ -2929,12 +350,10 @@ async function gameLoop() {
           quietCycles = 0;
         }
 
-        // Process games in order, prioritizing running games first
         const sortedGameIds = gameIds.sort((a, b) => {
           const stateA = gameStates.get(a);
           const stateB = gameStates.get(b);
 
-          // Running games get highest priority
           if (
             stateA?.phase === GamePhase.GAME_RUNNING &&
             stateB?.phase !== GamePhase.GAME_RUNNING
@@ -2946,15 +365,28 @@ async function gameLoop() {
           )
             return 1;
 
-          // Then by game ID (lower numbers first)
           return parseInt(a) - parseInt(b);
         });
 
         for (const gameId of sortedGameIds) {
-          await processGamePhase(gameId);
+          await processGamePhase(
+            gameId,
+            gameStates,
+            activeGameServer,
+            globalPublicClient,
+            globalWalletClient,
+            globalContractAddress,
+            lastWaitingLogs,
+            payoutRetryCount,
+            payoutLastRetryTime,
+            revealRetryCount,
+            revealLastRetryTime,
+            completedGamesCount,
+            startGameServer,
+            monitorGameProgressWrapper
+          );
         }
 
-        // Only log server status when it changes
         const currentServerStatus = activeGameServer
           ? `Game ${activeGameServer} on port 8000`
           : "No active server";
@@ -2967,29 +399,26 @@ async function gameLoop() {
           lastServerStatus = currentServerStatus;
         }
       } else {
-        // Only log waiting message occasionally (every 2 minutes = 480 cycles * 250ms)
         if (quietCycles === 0 || quietCycles % 480 === 0) {
           log(`💤 No games to process, waiting for new games...`);
         }
       }
 
       quietCycles++;
-
-      // Wait before next iteration
-      await new Promise((resolve) => setTimeout(resolve, 250)); // 250ms delay
+      await new Promise((resolve) => setTimeout(resolve, 250));
     } catch (error) {
       log(`❌ Error in game loop: ${error.message}`);
-      await new Promise((resolve) => setTimeout(resolve, 1000)); // 1 second delay on error
+      await new Promise((resolve) => setTimeout(resolve, 1000));
     }
   }
 }
 
+// Main function
 async function main() {
   try {
     console.log("\n🎮 AUTOMATED GAME MANAGER");
     console.log("========================");
 
-    // Initialize global blockchain clients (including contract address validation)
     const clientsInitialized = await initializeGlobalClients();
     if (!clientsInitialized) {
       console.error("❌ Failed to initialize blockchain clients");
@@ -2998,9 +427,13 @@ async function main() {
 
     log(`🎯 Gamemaster account: ${globalAccount.address}`);
 
-    // Scan for existing games first
     log(`🔍 Scanning for existing games...`);
-    const existingGameCount = await scanForExistingGames();
+    const existingGameCount = await scanForExistingGames(
+      globalPublicClient,
+      globalContractAddress,
+      globalAccount,
+      gameStates
+    );
 
     if (existingGameCount > 0) {
       log(`📋 Found ${existingGameCount} existing games to manage`);
@@ -3008,10 +441,13 @@ async function main() {
       log(`📭 No existing games found where we are gamemaster`);
     }
 
-    // Set up event listeners for new games
-    await setupEventListeners();
+    await setupEventListeners(
+      globalPublicClient,
+      globalContractAddress,
+      globalAccount,
+      gameStates
+    );
 
-    // Start game loop
     log(`🚀 Starting automated game management...`);
     log(`⏰ Processing games every 250ms...`);
 
@@ -3034,20 +470,19 @@ async function main() {
 process.on("SIGINT", async () => {
   log("🛑 Shutting down gracefully...");
 
-  // Save any active game scores
-  if (currentGameId && players.length > 0) {
+  if (currentGameId) {
     try {
       const playerData = getCurrentPlayerData(currentGameId);
-      saveGameScores(currentGameId, playerData);
-      log(`💾 Saved final scores for game ${currentGameId}`);
+      if (playerData.length > 0) {
+        saveGameScores(currentGameId, playerData);
+        log(`💾 Saved final scores for game ${currentGameId}`);
+      }
     } catch (error) {
       log(`Error saving scores: ${error.message}`);
     }
   }
 
-  // Stop servers
   await stopGameServer();
-
   log("👋 Shutdown complete");
   process.exit(0);
 });
