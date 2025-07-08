@@ -108,6 +108,15 @@ const FULL_CONTRACT_ABI = [
     name: "HashCommitted",
     type: "event",
   },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "gameId", type: "uint256" },
+      { indexed: false, name: "blockHash", type: "bytes32" },
+    ],
+    name: "BlockHashStored",
+    type: "event",
+  },
   // Contract functions
   {
     inputs: [{ name: "gameId", type: "uint256" }],
@@ -141,6 +150,7 @@ const FULL_CONTRACT_ABI = [
       { name: "_randomHash", type: "bytes32" },
       { name: "_hasCommitted", type: "bool" },
       { name: "_hasRevealed", type: "bool" },
+      { name: "_hasStoredBlockHash", type: "bool" },
       { name: "_mapSize", type: "uint256" },
     ],
     stateMutability: "view",
@@ -163,6 +173,13 @@ const FULL_CONTRACT_ABI = [
       { name: "_hash", type: "bytes32" },
     ],
     name: "commitHash",
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "storeCommitBlockHash",
     outputs: [],
     stateMutability: "nonpayable",
     type: "function",
@@ -238,6 +255,92 @@ function log(message, gameId = null) {
   const timestamp = new Date().toISOString();
   const prefix = gameId ? `[Game ${gameId}]` : `[System]`;
   console.log(`${timestamp} ${prefix} ${message}`);
+}
+
+// Helper function to check if a block hash is still available
+async function isBlockHashAvailable(gameId) {
+  try {
+    await globalPublicClient.readContract({
+      address: globalContractAddress,
+      abi: FULL_CONTRACT_ABI,
+      functionName: "getCommitBlockHash",
+      args: [BigInt(gameId)],
+    });
+    return true;
+  } catch (error) {
+    if (
+      error.message.includes("Commit block hash not available") ||
+      error.message.includes("too old")
+    ) {
+      return false;
+    }
+    // For other errors, assume it's available and let the calling function handle it
+    return true;
+  }
+}
+
+// Helper function to check if a game is too old to start
+async function isGameTooOldToStart(gameId) {
+  try {
+    const commitState = await globalPublicClient.readContract({
+      address: globalContractAddress,
+      abi: FULL_CONTRACT_ABI,
+      functionName: "getCommitRevealState",
+      args: [BigInt(gameId)],
+    });
+
+    const [, commitBlockNumber, , , hasCommitted] = commitState;
+
+    if (!hasCommitted) {
+      return false; // Game not committed yet, not too old
+    }
+
+    // Get current block number
+    const currentBlockNumber = await globalPublicClient.getBlockNumber();
+    const blocksDiff = currentBlockNumber - commitBlockNumber;
+
+    // Ethereum typically keeps 256 blocks of history
+    // We'll use 240 as a safety margin
+    const MAX_BLOCK_AGE = 240;
+
+    if (blocksDiff > MAX_BLOCK_AGE) {
+      log(
+        `⚠️ Game is too old to start: committed at block ${commitBlockNumber}, current block ${currentBlockNumber} (${blocksDiff} blocks ago)`,
+        gameId
+      );
+      return true;
+    }
+
+    return false;
+  } catch (error) {
+    log(`❌ Error checking game age: ${error.message}`, gameId);
+    return false;
+  }
+}
+
+// Helper function to mark a game as failed due to being too old
+function markGameAsExpired(gameId) {
+  const gameState = gameStates.get(gameId);
+  if (gameState) {
+    gameState.phase = GamePhase.COMPLETE;
+    gameState.expired = true;
+    gameState.expiredReason = "Block hash too old - game cannot be started";
+    gameStates.set(gameId, gameState);
+
+    log(
+      `❌ Game marked as EXPIRED: Block hash too old to start game server`,
+      gameId
+    );
+    log(
+      `💡 This happens when too much time passes between commit and game closure`,
+      gameId
+    );
+    log(
+      `⏰ Games must be closed within ~50 minutes of commit (256 blocks)`,
+      gameId
+    );
+    log(`🔄 Game will be removed from active processing`, gameId);
+  }
 }
 
 // Helper function to convert BigInt values to numbers for JSON serialization
@@ -375,10 +478,19 @@ async function commitHashForGame(gameId) {
       args: [BigInt(gameId)],
     });
 
-    const [, , , , hasCommitted] = currentState;
-    if (hasCommitted) {
-      log(`Hash already committed for game ${gameId}`, gameId);
+    const [, , , , hasCommitted, , hasStoredBlockHash] = currentState;
+    if (hasCommitted && hasStoredBlockHash) {
+      log(
+        `Hash already committed and block hash stored for game ${gameId}`,
+        gameId
+      );
       return true;
+    }
+
+    // If hash is committed but block hash not stored, try to store it
+    if (hasCommitted && !hasStoredBlockHash) {
+      log(`Hash already committed, attempting to store block hash...`, gameId);
+      return await storeCommitBlockHashForGame(gameId);
     }
 
     // Generate random reveal value
@@ -411,14 +523,159 @@ async function commitHashForGame(gameId) {
     if (receipt.status === "success") {
       log(`Commit successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
       log(`Game is now open for players to join`, gameId);
+
+      // Schedule the block hash storage after 15 seconds to ensure block is mined
+      log(`Scheduling block hash storage in 15 seconds...`, gameId);
+      setTimeout(async () => {
+        await storeCommitBlockHashForGame(gameId);
+      }, 15000);
+
       return true;
     } else {
       log(`Commit failed!`, gameId);
       return false;
     }
   } catch (error) {
-    log(`Error in commit phase: ${error.message}`, gameId);
+    // Handle insufficient funds more gracefully
+    if (
+      error.message.includes("Sender doesn't have enough funds") ||
+      error.message.includes("insufficient funds")
+    ) {
+      log(`💰 Insufficient funds for commit transaction`, gameId);
+      log(`💡 Gamemaster account needs ETH for gas fees`, gameId);
+
+      // Log the specific amounts for debugging
+      const errorMsg = error.message;
+      const balanceMatch = errorMsg.match(/sender's balance is: (\d+)/);
+      const costMatch = errorMsg.match(/max upfront cost is: (\d+)/);
+
+      if (balanceMatch && costMatch) {
+        const balance = parseInt(balanceMatch[1]);
+        const cost = parseInt(costMatch[1]);
+        log(`💰 Current balance: ${(balance / 1e18).toFixed(6)} ETH`, gameId);
+        log(`💰 Required for tx: ${(cost / 1e18).toFixed(6)} ETH`, gameId);
+        log(
+          `💰 Need additional: ${((cost - balance) / 1e18).toFixed(6)} ETH`,
+          gameId
+        );
+      }
+    } else {
+      log(`Error in commit phase: ${error.message}`, gameId);
+    }
     return false;
+  }
+}
+
+async function storeCommitBlockHashForGame(gameId) {
+  try {
+    // Only log start message every 30 seconds to avoid spam
+    const blockHashStartKey = `block_hash_start_${gameId}`;
+    if (shouldLogWaitingMessage(blockHashStartKey)) {
+      log(`Starting block hash storage...`, gameId);
+    }
+
+    // Check current state
+    const currentState = await globalPublicClient.readContract({
+      address: globalContractAddress,
+      abi: FULL_CONTRACT_ABI,
+      functionName: "getCommitRevealState",
+      args: [BigInt(gameId)],
+    });
+
+    const [, commitBlockNumber, , , hasCommitted, , hasStoredBlockHash] =
+      currentState;
+    if (!hasCommitted) {
+      log(`No hash committed yet for game ${gameId}`, gameId);
+      return false;
+    }
+
+    if (hasStoredBlockHash) {
+      log(`Block hash already stored for game ${gameId}`, gameId);
+      return true;
+    }
+
+    // Debug block timing (throttled to avoid spam)
+    const currentBlockNumber = await globalPublicClient.getBlockNumber();
+    const blockHashLogKey = `block_hash_waiting_${gameId}`;
+
+    // Check if we're ready based on block numbers
+    if (currentBlockNumber < commitBlockNumber) {
+      // Only log debug info every 30 seconds to avoid spam
+      if (shouldLogWaitingMessage(blockHashLogKey)) {
+        log(`🔍 Block timing debug:`, gameId);
+        log(`  - Commit block number: ${commitBlockNumber}`, gameId);
+        log(`  - Current block number: ${currentBlockNumber}`, gameId);
+        log(
+          `  - Blocks passed: ${currentBlockNumber - commitBlockNumber}`,
+          gameId
+        );
+        log(`  - Ready: NO`, gameId);
+        log(
+          `⏰ Still waiting for commit block ${commitBlockNumber} (currently at ${currentBlockNumber})`,
+          gameId
+        );
+      }
+      return false;
+    }
+
+    // Store the commit block hash
+    log(`Storing commit block hash...`, gameId);
+    const storeTxHash = await globalWalletClient.writeContract({
+      address: globalContractAddress,
+      abi: FULL_CONTRACT_ABI,
+      functionName: "storeCommitBlockHash",
+      args: [BigInt(gameId)],
+    });
+
+    log(`Store block hash transaction: ${storeTxHash}`, gameId);
+
+    // Wait for confirmation
+    const receipt = await globalPublicClient.waitForTransactionReceipt({
+      hash: storeTxHash,
+    });
+
+    if (receipt.status === "success") {
+      log(
+        `Block hash stored successfully! Gas used: ${receipt.gasUsed.toString()}`,
+        gameId
+      );
+      log(`Commit phase fully completed - game ready for closure`, gameId);
+      return true;
+    } else {
+      log(`Block hash storage failed!`, gameId);
+      return false;
+    }
+  } catch (error) {
+    // Handle different types of errors more gracefully
+    if (
+      error.message.includes("Commit block hash not available") ||
+      error.message.includes("too old") ||
+      error.message.includes("Must wait for the commit block")
+    ) {
+      // Only log block readiness messages every 30 seconds to avoid spam
+      const blockHashLogKey = `block_hash_waiting_${gameId}`;
+      if (shouldLogWaitingMessage(blockHashLogKey)) {
+        log(`❌ Block hash storage error details:`, gameId);
+        log(`  - Error message: ${error.message}`, gameId);
+        log(`  - Error type: ${error.name || "Unknown"}`, gameId);
+        log(`⏳ Block not ready yet for hash storage, will retry...`, gameId);
+      }
+      return false;
+    } else if (
+      error.message.includes("Sender doesn't have enough funds") ||
+      error.message.includes("insufficient funds")
+    ) {
+      log(`💰 Insufficient funds for block hash storage`, gameId);
+      log(`💡 Gamemaster account needs more ETH for gas fees`, gameId);
+      return false;
+    } else {
+      log(`❌ Unexpected error storing block hash: ${error.message}`, gameId);
+      // Log stack trace for debugging
+      if (error.stack) {
+        log(`📍 Error stack: ${error.stack}`, gameId);
+      }
+      return false;
+    }
   }
 }
 
@@ -764,7 +1021,8 @@ async function updateGameState(gameId) {
       args: [BigInt(gameId)],
     });
 
-    const [, , , , hasCommitted, hasRevealed, mapSize] = commitState;
+    const [, , , , hasCommitted, hasRevealed, hasStoredBlockHash, mapSize] =
+      commitState;
 
     // Get payout state
     const payoutInfo = await globalPublicClient.readContract({
@@ -782,8 +1040,8 @@ async function updateGameState(gameId) {
       phase = GamePhase.COMPLETE;
     } else if (hasPaidOut) {
       phase = GamePhase.PAYOUT_COMPLETE;
-    } else if (hasClosed && hasCommitted) {
-      // Game is closed and committed, check if it's already finished
+    } else if (hasClosed && hasCommitted && hasStoredBlockHash) {
+      // Game is closed and fully committed (including block hash stored), check if it's already finished
       try {
         const playerScores = loadGameScores(gameId);
         const allPlayersFinished = playerScores.every((p) => {
@@ -839,6 +1097,7 @@ async function updateGameState(gameId) {
       hasClosed,
       hasCommitted,
       hasRevealed,
+      hasStoredBlockHash,
       hasPaidOut,
       mapSize: Number(mapSize) || 0,
       phase,
@@ -874,6 +1133,7 @@ function logGameState(gameState, verbose = false) {
     log(`  Has Opened: ${gameState.hasOpened}`, gameId);
     log(`  Has Closed: ${gameState.hasClosed}`, gameId);
     log(`  Has Committed: ${gameState.hasCommitted}`, gameId);
+    log(`  Has Stored Block Hash: ${gameState.hasStoredBlockHash}`, gameId);
     log(`  Has Revealed: ${gameState.hasRevealed}`, gameId);
     log(`  Has Paid Out: ${gameState.hasPaidOut}`, gameId);
     log(`  Player Count: ${gameState.playerCount}`, gameId);
@@ -915,16 +1175,26 @@ async function processGamePhase(gameId) {
   // Check if phase changed to decide on verbose logging
   const lastState = gameStates.get(gameId);
   const phaseChanged = !lastState || lastState.phase !== gameState.phase;
-  const needsAction = [
+
+  // Define immediate action phases (need immediate attention)
+  const immediateActionPhases = [
     GamePhase.CREATED,
     GamePhase.CLOSED,
     GamePhase.GAME_FINISHED,
     GamePhase.PAYOUT_COMPLETE,
-  ].includes(gameState.phase);
+  ];
 
-  // Determine if we should log this cycle
+  const needsImmediateAction = immediateActionPhases.includes(gameState.phase);
+
+  // Block hash storage is a waiting action, not immediate
+  const needsBlockHashStorage =
+    gameState.phase === GamePhase.COMMITTED &&
+    gameState.hasCommitted &&
+    !gameState.hasStoredBlockHash;
+
+  // Determine if we should log this cycle - only for immediate actions or phase changes
   const shouldLogThisCycle =
-    phaseChanged || needsAction || shouldLogWaitingMessage(gameId);
+    phaseChanged || needsImmediateAction || shouldLogWaitingMessage(gameId);
 
   // Check if game is in backoff period and should be quiet
   let inBackoff = false;
@@ -954,7 +1224,7 @@ async function processGamePhase(gameId) {
 
   // Log state if needed (but be quiet during backoff periods unless phase changed)
   if (shouldLogThisCycle) {
-    if (phaseChanged || needsAction) {
+    if (phaseChanged || needsImmediateAction) {
       logGameState(gameState, true);
     } else if (!inBackoff) {
       // Only log non-verbose state if not in backoff
@@ -965,8 +1235,8 @@ async function processGamePhase(gameId) {
 
   switch (gameState.phase) {
     case GamePhase.CREATED:
-      // Need to commit hash
-      log(`🎯 Action needed: Commit hash`, gameId);
+      // Need to commit hash and store block hash
+      log(`🎯 Action needed: Commit hash and store block hash`, gameId);
       const commitSuccess = await commitHashForGame(gameId);
       if (commitSuccess) {
         log(`✅ Commit phase completed`, gameId);
@@ -976,12 +1246,31 @@ async function processGamePhase(gameId) {
       break;
 
     case GamePhase.COMMITTED:
-      // Game is open for players to join, wait for game to be closed - only log occasionally
-      if (shouldLogThisCycle && !needsAction) {
-        log(
-          `⏳ Game is open for players to join. Waiting for game to be closed by creator...`,
-          gameId
-        );
+      // Check if block hash needs to be stored
+      if (needsBlockHashStorage) {
+        // Only log action messages every 30 seconds to avoid spam
+        const blockHashActionKey = `block_hash_action_${gameId}`;
+        if (shouldLogWaitingMessage(blockHashActionKey)) {
+          log(`🎯 Action needed: Store commit block hash`, gameId);
+        }
+
+        const storeSuccess = await storeCommitBlockHashForGame(gameId);
+        if (storeSuccess) {
+          log(`✅ Block hash storage completed`, gameId);
+        } else {
+          // Only log failure message every 30 seconds to avoid spam
+          if (shouldLogWaitingMessage(blockHashActionKey)) {
+            log(`❌ Block hash storage failed (will retry)`, gameId);
+          }
+        }
+      } else {
+        // Game is open for players to join, wait for game to be closed - only log occasionally
+        if (shouldLogThisCycle && !needsImmediateAction) {
+          log(
+            `⏳ Game is open for players to join. Waiting for game to be closed by creator...`,
+            gameId
+          );
+        }
       }
       break;
 
@@ -1003,10 +1292,10 @@ async function processGamePhase(gameId) {
         const serverStarted = await startGameServer(gameId);
         if (!serverStarted) {
           // Game was already finished, update phase
-          const gameState = gameStates.get(gameId);
-          if (gameState) {
-            gameState.phase = GamePhase.GAME_FINISHED;
-            gameStates.set(gameId, gameState);
+          const updatedGameState = gameStates.get(gameId);
+          if (updatedGameState) {
+            updatedGameState.phase = GamePhase.GAME_FINISHED;
+            gameStates.set(gameId, updatedGameState);
             log(
               `📊 Game phase updated to GAME_FINISHED (already completed)`,
               gameId
@@ -1071,8 +1360,8 @@ async function processGamePhase(gameId) {
 
     case GamePhase.PAYOUT_COMPLETE:
       // Run reveal
-      const gameState = gameStates.get(gameId);
-      if (gameState && gameState.payoutSkipped) {
+      const currentGameState = gameStates.get(gameId);
+      if (currentGameState && currentGameState.payoutSkipped) {
         log(`⚠️ Note: Payout was skipped due to insufficient funds`, gameId);
         log(`💡 Winners were not paid out on-chain`, gameId);
       }
@@ -1113,8 +1402,8 @@ async function processGamePhase(gameId) {
       );
       const revealSuccess = await revealGame(gameId);
       if (revealSuccess) {
-        const gameState = gameStates.get(gameId);
-        if (gameState && gameState.revealSkipped) {
+        const finalGameState = gameStates.get(gameId);
+        if (finalGameState && finalGameState.revealSkipped) {
           log(
             `⚠️ Note: Reveal was skipped due to blockhash being too old`,
             gameId
@@ -1127,7 +1416,7 @@ async function processGamePhase(gameId) {
         log(`✅ Reveal phase completed`, gameId);
 
         // Schedule delayed shutdown of game server to give frontend time to finish
-        log(`⏲️ Scheduling game server shutdown in 10 seconds...`, gameId);
+        log(`⏲️ Scheduling game server shutdown in 15 seconds...`, gameId);
         setTimeout(() => {
           if (activeGameServer === gameId) {
             log(
@@ -1141,7 +1430,7 @@ async function processGamePhase(gameId) {
               gameId
             );
           }
-        }, 10000); // 10 second delay
+        }, 15000); // 15 second delay
       } else {
         const newRetryCount = revealRetryCount.get(gameId) || 0;
         if (newRetryCount < 1) {
@@ -1171,7 +1460,10 @@ async function processGamePhase(gameId) {
         if (
           key.startsWith("timer_warning_") ||
           key.startsWith("payout_retry_") ||
-          key.startsWith("reveal_retry_")
+          key.startsWith("reveal_retry_") ||
+          key.startsWith("block_hash_waiting_") ||
+          key.startsWith("block_hash_action_") ||
+          key.startsWith("block_hash_start_")
         ) {
           keysToDelete.push(key);
         }
@@ -1192,6 +1484,25 @@ async function processGamePhase(gameId) {
 async function startGameServer(gameId) {
   try {
     log(`🚀 Starting game server for game ${gameId}...`, gameId);
+
+    // First check if the game is too old to start
+    const tooOld = await isGameTooOldToStart(gameId);
+    if (tooOld) {
+      log(
+        `⚠️ Game is too old to start - block hash no longer available`,
+        gameId
+      );
+      markGameAsExpired(gameId);
+      return false;
+    }
+
+    // Double-check block hash availability before proceeding
+    const blockHashAvailable = await isBlockHashAvailable(gameId);
+    if (!blockHashAvailable) {
+      log(`⚠️ Block hash not available for game - marking as expired`, gameId);
+      markGameAsExpired(gameId);
+      return false;
+    }
 
     // Check if game is already finished (has completed scores)
     let gameAlreadyFinished = false;
@@ -1229,13 +1540,28 @@ async function startGameServer(gameId) {
       return false;
     }
 
-    // Check if reveal file exists
+    // Check if reveal file exists and load it
     log(`🔍 Checking for reveal file...`, gameId);
+    let revealValue;
     try {
-      const revealValue = loadRevealValue(gameId);
+      revealValue = loadRevealValue(gameId);
       log(`✅ Found reveal value: ${revealValue.substring(0, 10)}...`, gameId);
+    } catch (revealError) {
+      log(
+        `❌ Cannot start server - missing reveal file: ${revealError.message}`,
+        gameId
+      );
+      log(
+        `💡 This suggests the commit phase was not completed successfully`,
+        gameId
+      );
+      return false;
+    }
 
-      // Get map size from contract
+    // Get map size from contract
+    let contractMapSize;
+    let contractPlayers;
+    try {
       const commitState = await globalPublicClient.readContract({
         address: globalContractAddress,
         abi: FULL_CONTRACT_ABI,
@@ -1249,37 +1575,205 @@ async function startGameServer(gameId) {
         throw new Error("Hash not committed yet");
       }
 
-      const contractMapSize = Number(mapSize);
-      if (contractMapSize <= 0) {
-        throw new Error("Invalid map size from contract");
-      }
+      contractMapSize = Number(mapSize);
 
-      log(
-        `🗺️ Using map size from contract: ${contractMapSize}x${contractMapSize}`,
-        gameId
-      );
-
-      // Get players for logging
-      const contractPlayers = await globalPublicClient.readContract({
+      // Get player count to validate map size
+      contractPlayers = await globalPublicClient.readContract({
         address: globalContractAddress,
         abi: FULL_CONTRACT_ABI,
         functionName: "getPlayers",
         args: [BigInt(gameId)],
       });
 
-      log(`🎮 Generating map for ${contractPlayers.length} players...`, gameId);
+      log(`🔍 Contract debugging:`, gameId);
+      log(`  - Raw mapSize from contract: ${contractMapSize}`, gameId);
+      log(`  - Player count from contract: ${contractPlayers.length}`, gameId);
+      log(`  - Players: ${JSON.stringify(contractPlayers)}`, gameId);
 
-      // Calculate the randomHash that will be used for map generation
-      // This matches exactly what the contract will calculate when we call revealHash
-      const randomHash = await calculateRandomHash(gameId, revealValue);
+      // Let's also check the full commit-reveal state for debugging
+      const fullCommitState = await globalPublicClient.readContract({
+        address: globalContractAddress,
+        abi: FULL_CONTRACT_ABI,
+        functionName: "getCommitRevealState",
+        args: [BigInt(gameId)],
+      });
+      log(
+        `  - Full commit state: hasCommitted=${fullCommitState[4]}, hasRevealed=${fullCommitState[5]}, hasStoredBlockHash=${fullCommitState[6]}, mapSize=${fullCommitState[7]}`,
+        gameId
+      );
 
+      // Also check game info to see if game is properly closed
+      const gameInfo = await globalPublicClient.readContract({
+        address: globalContractAddress,
+        abi: FULL_CONTRACT_ABI,
+        functionName: "getGameInfo",
+        args: [BigInt(gameId)],
+      });
+      log(
+        `  - Game info: hasOpened=${gameInfo[5]}, hasClosed=${gameInfo[6]}, open=${gameInfo[3]}, playerCount=${gameInfo[4]}`,
+        gameId
+      );
+
+      // Calculate expected map size: 1 + (MAP_MULTIPLIER × playerCount)
+      const expectedMapSize = 1 + MAP_MULTIPLIER * contractPlayers.length;
+      log(
+        `  - Expected map size calculation: 1 + (${MAP_MULTIPLIER} × ${contractPlayers.length}) = ${expectedMapSize}`,
+        gameId
+      );
+
+      // Check if contract returned the correct map size
+      if (contractMapSize <= 0 || contractMapSize !== expectedMapSize) {
+        if (contractMapSize > 0) {
+          log(
+            `⚠️ Contract returned incorrect map size: ${contractMapSize}, expected ${expectedMapSize} for ${contractPlayers.length} players`,
+            gameId
+          );
+        } else {
+          log(
+            `⚠️ Contract returned invalid map size: ${contractMapSize}, calculating manually`,
+            gameId
+          );
+        }
+
+        // Use the correct calculated size
+        contractMapSize = expectedMapSize;
+        log(
+          `🧮 Using correct map size: ${contractMapSize}x${contractMapSize} (${contractPlayers.length} players)`,
+          gameId
+        );
+      } else {
+        log(
+          `🗺️ Contract map size verified: ${contractMapSize}x${contractMapSize} (${contractPlayers.length} players)`,
+          gameId
+        );
+      }
+    } catch (contractError) {
+      log(
+        `❌ Error getting map size from contract: ${contractError.message}`,
+        gameId
+      );
+      return false;
+    }
+
+    // Ensure we have contractPlayers data
+    if (!contractPlayers) {
+      log(`❌ Failed to get player data from contract`, gameId);
+      return false;
+    }
+
+    // Log map generation
+    log(`🎮 Generating map for ${contractPlayers.length} players...`, gameId);
+
+    // Calculate the randomHash - this is where the block hash issue might occur
+    let randomHash;
+    try {
+      randomHash = await calculateRandomHash(gameId, revealValue);
+      log(
+        `✅ Random hash calculated: ${randomHash.substring(0, 10)}...`,
+        gameId
+      );
+    } catch (randomHashError) {
+      log(
+        `❌ Failed to calculate random hash: ${randomHashError.message}`,
+        gameId
+      );
+
+      // Check if this is a block hash availability error
+      if (
+        randomHashError.message.includes("Commit block hash not available") ||
+        randomHashError.message.includes("too old")
+      ) {
+        log(`⚠️ Block hash is too old - marking game as expired`, gameId);
+        markGameAsExpired(gameId);
+      } else {
+        log(
+          `💡 This suggests an issue with the reveal value or contract state`,
+          gameId
+        );
+      }
+      return false;
+    }
+
+    // Generate map using the calculated random hash
+    let mapData;
+    try {
+      log(`🎲 Starting map generation with randomHash: ${randomHash}`, gameId);
+      log(`📏 Target map size: ${contractMapSize}x${contractMapSize}`, gameId);
+
+      // Step 1: Initialize DeterministicDice
+      log(`🎲 Initializing DeterministicDice with randomHash...`, gameId);
       const dice = new DeterministicDice(randomHash);
+      log(`✅ DeterministicDice initialized successfully`, gameId);
+
+      // Step 2: Initialize GameLandGenerator
+      log(
+        `🗺️ Initializing GameLandGenerator with size ${contractMapSize}...`,
+        gameId
+      );
       const mapGenerator = new GameLandGenerator(dice, contractMapSize);
+      log(`✅ GameLandGenerator initialized`, gameId);
+      log(`📊 Generator initial state:`, gameId);
+      log(`  - Size: ${mapGenerator.size}`, gameId);
+      log(
+        `  - Land array length: ${
+          mapGenerator.land ? mapGenerator.land.length : "undefined"
+        }`,
+        gameId
+      );
 
+      // Step 3: Generate the land
+      log(`🌱 Calling generateLand()...`, gameId);
       mapGenerator.generateLand();
-      mapGenerator.placeStartingPosition();
+      log(`✅ generateLand() completed`, gameId);
+      log(`📊 After generateLand():`, gameId);
+      log(`  - Size: ${mapGenerator.size}`, gameId);
+      log(
+        `  - Land array length: ${
+          mapGenerator.land ? mapGenerator.land.length : "undefined"
+        }`,
+        gameId
+      );
+      if (mapGenerator.land && mapGenerator.land.length > 0) {
+        log(
+          `  - First row length: ${
+            mapGenerator.land[0] ? mapGenerator.land[0].length : "undefined"
+          }`,
+          gameId
+        );
+        log(
+          `  - Sample tiles from first row: ${
+            mapGenerator.land[0]
+              ? mapGenerator.land[0].slice(
+                  0,
+                  Math.min(5, mapGenerator.land[0].length)
+                )
+              : "undefined"
+          }`,
+          gameId
+        );
+      }
 
-      const mapData = {
+      // Step 4: Place starting position
+      log(`📍 Calling placeStartingPosition()...`, gameId);
+      mapGenerator.placeStartingPosition();
+      log(`✅ placeStartingPosition() completed`, gameId);
+      log(`📊 After placeStartingPosition():`, gameId);
+      if (mapGenerator.startingPosition) {
+        log(
+          `  - Starting position: x=${mapGenerator.startingPosition.x}, y=${mapGenerator.startingPosition.y}`,
+          gameId
+        );
+        log(
+          `  - Original land type: ${mapGenerator.startingPosition.originalLandType}`,
+          gameId
+        );
+      } else {
+        log(`  - Starting position: undefined`, gameId);
+      }
+
+      // Step 5: Create final map data structure
+      log(`📦 Creating final map data structure...`, gameId);
+      mapData = {
         size: mapGenerator.size,
         land: mapGenerator.land,
         startingPosition: mapGenerator.startingPosition,
@@ -1291,46 +1785,93 @@ async function startGameServer(gameId) {
         },
       };
 
-      saveGameMap(gameId, mapData);
-      log(`✅ Map generated: ${mapData.size}x${mapData.size}`, gameId);
+      // Step 6: Detailed validation of final map
+      log(`🔍 Final map validation:`, gameId);
+      log(`  - Map size: ${mapData.size}x${mapData.size}`, gameId);
+      log(
+        `  - Land array dimensions: ${
+          mapData.land ? mapData.land.length : "undefined"
+        } x ${
+          mapData.land && mapData.land[0] ? mapData.land[0].length : "undefined"
+        }`,
+        gameId
+      );
 
-      // Stop current server if running
-      if (activeGameServer) {
-        log(`🛑 Stopping current server for game ${activeGameServer}`, gameId);
-        await stopGameServer();
-      }
-
-      // Start new server for this game
-      log(`🌐 Initializing HTTP server...`, gameId);
-      const serverStarted = await initializeGameServer(gameId);
-
-      if (serverStarted) {
-        activeGameServer = gameId;
-        currentGameId = gameId;
-        log(`✅ Game server started successfully for game ${gameId}!`, gameId);
-        log(`🌍 Server accessible at http://localhost:8000`, gameId);
-        log(`🎮 Players can now access the game!`, gameId);
-
-        // Update game state to GAME_RUNNING
-        const gameState = gameStates.get(gameId);
-        if (gameState) {
-          gameState.phase = GamePhase.GAME_RUNNING;
-          gameStates.set(gameId, gameState);
-          log(`📊 Game phase updated to GAME_RUNNING`, gameId);
+      if (mapData.land && mapData.land.length > 0) {
+        // Count tile types
+        const tileCounts = {};
+        for (let y = 0; y < mapData.land.length; y++) {
+          for (let x = 0; x < mapData.land[y].length; x++) {
+            const tile = mapData.land[y][x];
+            tileCounts[tile] = (tileCounts[tile] || 0) + 1;
+          }
         }
-        return true;
-      } else {
-        log(`❌ Failed to start game server`, gameId);
-        return false;
+        log(`  - Tile distribution: ${JSON.stringify(tileCounts)}`, gameId);
+
+        // Show a sample of the map
+        log(`  - Map preview (first 3x3):`, gameId);
+        for (let y = 0; y < Math.min(3, mapData.land.length); y++) {
+          const row = [];
+          for (let x = 0; x < Math.min(3, mapData.land[y].length); x++) {
+            row.push(mapData.land[y][x]);
+          }
+          log(`    Row ${y}: [${row.join(", ")}]`, gameId);
+        }
       }
-    } catch (revealError) {
-      log(`❌ Cannot start server - error: ${revealError.message}`, gameId);
-      log(`💡 Make sure the commit phase completed successfully`, gameId);
+
+      saveGameMap(gameId, mapData);
+      log(
+        `✅ Map generated successfully: ${mapData.size}x${mapData.size}`,
+        gameId
+      );
+    } catch (mapError) {
+      log(`❌ Error generating map: ${mapError.message}`, gameId);
+      log(`📍 Map generation error stack: ${mapError.stack}`, gameId);
+      return false;
+    }
+
+    // Stop current server if running
+    if (activeGameServer) {
+      log(`🛑 Stopping current server for game ${activeGameServer}`, gameId);
+      await stopGameServer();
+    }
+
+    // Start new server for this game
+    log(`🌐 Initializing HTTP server...`, gameId);
+    const serverStarted = await initializeGameServer(gameId);
+
+    if (serverStarted) {
+      activeGameServer = gameId;
+      currentGameId = gameId;
+      log(`✅ Game server started successfully for game ${gameId}!`, gameId);
+      log(`🌍 Server accessible at http://localhost:8000`, gameId);
+      log(`🎮 Players can now access the game!`, gameId);
+
+      // Update game state to GAME_RUNNING
+      const gameState = gameStates.get(gameId);
+      if (gameState) {
+        gameState.phase = GamePhase.GAME_RUNNING;
+        gameStates.set(gameId, gameState);
+        log(`📊 Game phase updated to GAME_RUNNING`, gameId);
+      }
+      return true;
+    } else {
+      log(`❌ Failed to start game server`, gameId);
       return false;
     }
   } catch (error) {
     log(`❌ Error starting game server: ${error.message}`, gameId);
     log(`📍 Stack trace: ${error.stack}`, gameId);
+
+    // Check if this is a block hash related error
+    if (
+      error.message.includes("Commit block hash not available") ||
+      error.message.includes("too old")
+    ) {
+      log(`⚠️ Block hash error detected - marking game as expired`, gameId);
+      markGameAsExpired(gameId);
+    }
+
     return false;
   }
 }
@@ -1358,7 +1899,10 @@ async function stopGameServer() {
     if (
       key.startsWith("timer_warning_") ||
       key.startsWith("payout_retry_") ||
-      key.startsWith("reveal_retry_")
+      key.startsWith("reveal_retry_") ||
+      key.startsWith("block_hash_waiting_") ||
+      key.startsWith("block_hash_action_") ||
+      key.startsWith("block_hash_start_")
     ) {
       keysToDelete.push(key);
     }
@@ -1446,10 +1990,10 @@ async function monitorGameProgress(gameId) {
       log(`🌐 Keeping game server running for payout/reveal phase...`, gameId);
 
       // Update game state
-      const gameState = gameStates.get(gameId);
-      if (gameState) {
-        gameState.phase = GamePhase.GAME_FINISHED;
-        gameStates.set(gameId, gameState);
+      const currentMonitoringGameState = gameStates.get(gameId);
+      if (currentMonitoringGameState) {
+        currentMonitoringGameState.phase = GamePhase.GAME_FINISHED;
+        gameStates.set(gameId, currentMonitoringGameState);
         log(`📊 Game phase updated to GAME_FINISHED`, gameId);
       }
 
@@ -1565,9 +2109,9 @@ async function setupEventListeners() {
           const gameId = eventLog.args.gameId.toString();
           const startTime = eventLog.args.startTime;
           const mapSize = eventLog.args.mapSize;
-          const gameState = gameStates.get(gameId);
+          const eventGameState = gameStates.get(gameId);
 
-          if (gameState) {
+          if (eventGameState) {
             log(`🔒 Game closed! Game ID: ${gameId}`, gameId);
             log(`📐 Map size calculated: ${mapSize}x${mapSize}`, gameId);
             log(
@@ -1576,10 +2120,10 @@ async function setupEventListeners() {
               ).toISOString()}`,
               gameId
             );
-            gameState.phase = GamePhase.CLOSED;
-            gameState.mapSize = Number(mapSize);
-            gameState.lastUpdated = Date.now();
-            gameStates.set(gameId, gameState);
+            eventGameState.phase = GamePhase.CLOSED;
+            eventGameState.mapSize = Number(mapSize);
+            eventGameState.lastUpdated = Date.now();
+            gameStates.set(gameId, eventGameState);
           }
         });
       },
@@ -1593,13 +2137,13 @@ async function setupEventListeners() {
       onLogs: (logs) => {
         logs.forEach((eventLog) => {
           const gameId = eventLog.args.gameId.toString();
-          const gameState = gameStates.get(gameId);
+          const commitGameState = gameStates.get(gameId);
 
-          if (gameState) {
+          if (commitGameState) {
             log(`📝 Hash committed for game ${gameId}`, gameId);
-            gameState.phase = GamePhase.COMMITTED;
-            gameState.lastUpdated = Date.now();
-            gameStates.set(gameId, gameState);
+            commitGameState.phase = GamePhase.COMMITTED;
+            commitGameState.lastUpdated = Date.now();
+            gameStates.set(gameId, commitGameState);
           }
         });
       },
@@ -1613,14 +2157,14 @@ async function setupEventListeners() {
       onLogs: (logs) => {
         logs.forEach((eventLog) => {
           const gameId = eventLog.args.gameId.toString();
-          const gameState = gameStates.get(gameId);
+          const openGameState = gameStates.get(gameId);
 
-          if (gameState) {
+          if (openGameState) {
             log(`🔓 Game opened for players! Game ID: ${gameId}`, gameId);
             log(`👥 Players can now join the game`, gameId);
             // Keep the COMMITTED phase since the game is waiting to be closed
-            gameState.lastUpdated = Date.now();
-            gameStates.set(gameId, gameState);
+            openGameState.lastUpdated = Date.now();
+            gameStates.set(gameId, openGameState);
           }
         });
       },
@@ -1749,10 +2293,25 @@ function getCurrentPlayerData(gameId) {
     const position = playerPositions.get(address.toLowerCase());
     const stats = playerStats.get(address.toLowerCase());
     if (position && stats) {
+      // Ensure position is within map bounds with wrapping
+      const wrappedX = wrapCoordinate(position.x, gameMap?.size);
+      const wrappedY = wrapCoordinate(position.y, gameMap?.size);
+
+      // Get tile value safely
+      let tile = 0; // Default to depleted if map access fails
+      if (
+        gameMap &&
+        gameMap.land &&
+        gameMap.land[wrappedY] &&
+        gameMap.land[wrappedY][wrappedX] !== undefined
+      ) {
+        tile = gameMap.land[wrappedY][wrappedX];
+      }
+
       playerData.push({
         address,
-        position,
-        tile: gameMap.land[position.y][position.x],
+        position: { x: wrappedX, y: wrappedY }, // Use wrapped coordinates
+        tile,
         score: stats.score,
         movesRemaining: stats.movesRemaining,
         minesRemaining: stats.minesRemaining,
@@ -1860,7 +2419,14 @@ async function loadPlayersFromContract(gameId) {
         gameId,
         mapSize
       );
-      playerPositions.set(playerAddress.toLowerCase(), startPos);
+
+      // Ensure position is within map bounds
+      const wrappedPos = {
+        x: wrapCoordinate(startPos.x, mapSize),
+        y: wrapCoordinate(startPos.y, mapSize),
+      };
+
+      playerPositions.set(playerAddress.toLowerCase(), wrappedPos);
       playerStats.set(playerAddress.toLowerCase(), {
         score: 0,
         movesRemaining: MAX_MOVES,
@@ -1870,8 +2436,10 @@ async function loadPlayersFromContract(gameId) {
       if (heavyDebug) {
         log(
           `🔍 [DEBUG] loadPlayersFromContract: Set ${playerAddress} at position ${JSON.stringify(
+            wrappedPos
+          )} (original: ${JSON.stringify(
             startPos
-          )} with stats {score:0, moves:${MAX_MOVES}, mines:${MAX_MINES}}`,
+          )}) with stats {score:0, moves:${MAX_MOVES}, mines:${MAX_MINES}}`,
           gameId
         );
       }
@@ -2476,6 +3044,7 @@ app.get("/status", (req, res) => {
         hasOpened: state.hasOpened,
         hasClosed: state.hasClosed,
         hasCommitted: state.hasCommitted,
+        hasStoredBlockHash: state.hasStoredBlockHash,
         hasRevealed: state.hasRevealed,
         hasPaidOut: state.hasPaidOut,
         mapSize: state.mapSize || 0,
