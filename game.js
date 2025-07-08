@@ -383,8 +383,15 @@ async function gameLoop() {
             revealLastRetryTime,
             completedGamesCount,
             startGameServer,
-            monitorGameProgressWrapper
+            monitorGameProgressWrapper,
+            stopGameServer
           );
+
+          // Check if the game was completed and server was stopped
+          if (!gameStates.has(gameId) && activeGameServer === gameId) {
+            activeGameServer = null;
+            currentGameId = null;
+          }
         }
 
         const currentServerStatus = activeGameServer

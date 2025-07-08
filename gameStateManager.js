@@ -147,7 +147,8 @@ export async function processGamePhase(
   revealLastRetryTime,
   completedGamesCount,
   startGameServerFn,
-  monitorGameProgressFn
+  monitorGameProgressFn,
+  stopGameServerFn
 ) {
   const gameState = await updateGameState(
     gameId,
@@ -412,13 +413,13 @@ export async function processGamePhase(
         log(`✅ Reveal phase completed`, gameId);
 
         log(`⏲️ Scheduling game server shutdown in 15 seconds...`, gameId);
-        setTimeout(() => {
+        setTimeout(async () => {
           if (activeGameServer === gameId) {
             log(
               `🛑 Delayed shutdown: Stopping game server for completed game ${gameId}`,
               gameId
             );
-            // This would need to be called from the main module
+            await stopGameServerFn();
           } else {
             log(
               `⏭️ Skipping delayed shutdown - different game server now active`,
@@ -441,6 +442,13 @@ export async function processGamePhase(
         `🗑️ Removing game ${gameId} from active processing (${completedGamesCount} total completed)`,
         gameId
       );
+
+      // Stop game server if this is the active game
+      if (activeGameServer === gameId) {
+        log(`🛑 Stopping game server for completed game ${gameId}`, gameId);
+        await stopGameServerFn();
+      }
+
       gameStates.delete(gameId);
       lastWaitingLogs.delete(gameId);
       payoutRetryCount.delete(gameId);
