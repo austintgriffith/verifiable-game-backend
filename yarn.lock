@@ -134,10 +134,10 @@ depd@2.0.0, depd@^2.0.0:
   resolved "https://registry.npmjs.org/depd/-/depd-2.0.0.tgz"
   integrity sha512-g7nH6P6dyDioJogAAGprGpCtVImJhpPk/roCzdb3fIh61/s/nPsfR6onyMwkCAR/OlC3yBC0lESvUoQEAssIrw==
 
-deterministic-map@^1.0.0:
-  version "1.0.0"
-  resolved "https://registry.npmjs.org/deterministic-map/-/deterministic-map-1.0.0.tgz"
-  integrity sha512-jNZzAncnM7eVHQVMICwM/qfpSxu6iUXcfjdaFCkJ4TxnG6WP8g/k+7SbdJIwWiTRiYuy3hRLoAT8EeMo/X04nQ==
+deterministic-map@1.0.3:
+  version "1.0.3"
+  resolved "https://registry.npmjs.org/deterministic-map/-/deterministic-map-1.0.3.tgz"
+  integrity sha512-s/KCGoY9AMxMZEFHztqvPrDG0JeOn0CceRgN/CoaX6vdr1S5y+0aD9qrg4SIlhflYbS1VNad5waS9rBblEAHkw==
   dependencies:
     lodash "^4.17.21"
 

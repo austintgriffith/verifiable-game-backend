@@ -6,11 +6,20 @@ Base URL: http://localhost:8000
 OVERVIEW
 --------
 This is a dynamic grid-based exploration game where players move around a map with different land types.
-The map size scales automatically based on the number of players (multiplier × player count).
-With the default multiplier of 5: 1 player = 5×5 map, 2 players = 10×10 map, 3 players = 15×15 map, etc.
-Game operators can adjust the MAP_MULTIPLIER constant in the code to change scaling behavior.
+The map size is calculated when the game is closed (after players join) and stored permanently in the smart contract.
+Map size calculation: mapSize = 1 + (MAP_MULTIPLIER × actual_player_count), where MAP_MULTIPLIER = 4.
+Examples: 1 player = 5×5 map, 2 players = 9×9 map, 3 players = 13×13 map, etc.
 Each player has a deterministic starting position based on their wallet address + reveal seed.
 Players can only see a 3x3 local view centered on their current position.
+
+GAME FLOW
+---------
+1. Gamemaster commits hash → Game opens for players to join
+2. Players join the game by staking ETH
+3. Creator closes the game → Map size calculated based on actual players who joined
+4. Game server starts with the calculated map size and generated map
+5. Players have 90 seconds to explore and mine
+6. Game ends, winners are paid out, hash is revealed
 
 GAME CONSTRAINTS
 ----------------
@@ -53,6 +62,16 @@ TIMER MECHANICS
 - When timer expires, all players' moves and mines are automatically set to 0
 - Game immediately ends and proceeds to payout phase
 - Players cannot move or mine once timer expires - API returns "Time expired! Game over."
+
+CONTRACT INTEGRATION
+--------------------
+- Map size is calculated and stored when the game is closed (after players join)
+- This ensures the map size reflects the actual number of players who participated
+- Frontend applications can get map size directly from the contract using:
+  - contract.getMapSize(gameId) - returns the map size for a specific game
+  - contract.getCommitRevealState(gameId) - returns mapSize as the 7th value
+- The map size is only available after the game has been closed by the creator
+- This ensures the map size is immutable and verifiable on-chain
 
 API ENDPOINTS
 =============
@@ -111,8 +130,6 @@ Response:
   "gameId": "12345",
   "activeGames": ["12345"],
   "serverStatus": "running",
-  "mapSize": 15,
-  "mapMultiplier": 5,
   "playerCount": 3,
   "timestamp": "2025-06-29T11:55:03.109Z",
   "timer": {
@@ -142,9 +159,7 @@ Response:
   "gameId": "12345",
   "timestamp": "2025-06-29T11:55:03.109Z",
   "gameLoaded": true,
-  "playersCount": 2,
-  "mapSize": 10,
-  "mapMultiplier": 5
+  "playersCount": 2
 }
 
 3. GET /status
@@ -157,8 +172,6 @@ Response:
   "gameId": "12345",
   "activeGames": ["12345"],
   "gameLoaded": true,
-  "mapSize": 10,
-  "mapMultiplier": 5,
   "totalPlayers": 2,
   "players": ["0x05937Df8ca0636505d92Fd769d303A3D461587ed", "0x1a39C55e6333025A3Be3768873C846632ACDb6f5"],
   "serverTime": "2025-06-29T11:55:03.109Z",
@@ -168,10 +181,25 @@ Response:
     "timeRemaining": 73,
     "timeElapsed": 17,
     "startTime": 1719657603109
+  },
+  "retryInfo": {},
+  "gameStates": {
+    "12345": {
+      "phase": "GAME_RUNNING",
+      "payoutSkipped": false,
+      "playerCount": 2,
+      "stakeAmount": 1000000000000000000,
+      "hasOpened": true,
+      "hasClosed": true,
+      "hasCommitted": true,
+      "hasRevealed": false,
+      "hasPaidOut": false,
+      "mapSize": 9
+    }
   }
 }
 
-
+Note: mapSize is included in gameStates for debugging purposes when the game is closed. It will be 0 if the game hasn't been closed yet.
 
 PROTECTED ENDPOINTS (Require JWT Token)
 ---------------------------------------
@@ -207,7 +235,6 @@ Response:
     ]
   ],
   "position": {"x": 8, "y": 3},
-  "mapSize": 10,
   "score": 15,
   "movesRemaining": 8,
   "minesRemaining": 1,
@@ -225,6 +252,7 @@ Notes:
 - localView is a 3x3 array with player at center [1][1]
 - "player": true marks the player's current position
 - coordinates show the actual map coordinates for each tile
+- To get map size, use contract.getMapSize(gameId) or contract.getCommitRevealState(gameId) (only available after game is closed)
 
 8. POST /move
 -------------
@@ -357,17 +385,17 @@ Response:
     }
   ],
   "count": 2,
-  "timeRemaining": 58,
-  "mapSize": 10,
-  "mapMultiplier": 5
+  "timeRemaining": 58
 }
 
 GAME MECHANICS
 ==============
-- Map size scales dynamically: MAP_SIZE = MAP_MULTIPLIER × PLAYER_COUNT (default multiplier = 5)
+- Map size is calculated when game is closed: mapSize = 1 + (MAP_MULTIPLIER × actual_player_count)
+- MAP_MULTIPLIER = 4, so: 1 player = 5×5 map, 2 players = 9×9 map, 3 players = 13×13 map
+- Map size is stored permanently in the smart contract when the game is closed and can be retrieved using:
+  - contract.getMapSize(gameId) - returns uint256 map size (only available after game is closed)
+  - contract.getCommitRevealState(gameId) - returns mapSize as 7th return value (only available after game is closed)
 - Coordinates range from 0 to (mapSize-1) with wrapping (edges connect to opposite side)
-- Current map size and multiplier are returned in API responses as "mapSize" and "mapMultiplier" fields
-- Examples: 1 player = 5×5 map, 2 players = 10×10 map, 4 players = 20×20 map
 - Players start at deterministic positions based on their address + reveal seed
 - Players can move one square at a time in 8 directions (12 moves max)
 - Players can mine their current tile for points (3 mines max)
@@ -400,27 +428,27 @@ Authentication Errors:
 SAMPLE CLIENT FLOW
 ==================
 1. GET /status - Check if game is loaded and see timer status
-2. GET /register - Get the message to sign
-3. Sign the message with your Ethereum wallet (e.g., MetaMask)
-4. POST /register - Submit signature to get JWT token
-5. GET /map - Get initial position and local view (with Authorization header)
-6. Monitor timeRemaining in all API responses to track time left
-7. POST /move - Make strategic moves based on what you see (max 12)
-8. POST /mine - Mine valuable tiles for points (max 3 times)
-9. Repeat steps 7-8 until moves/mines exhausted OR timer expires
-10. GET /players - Check final scores and rankings
+2. Check contract.getGameInfo(gameId) to see if game is closed, then call contract.getMapSize(gameId) - Get map size from contract (only available after game is closed)
+3. GET /register - Get the message to sign
+4. Sign the message with your Ethereum wallet (e.g., MetaMask)
+5. POST /register - Submit signature to get JWT token
+6. GET /map - Get initial position and local view (with Authorization header)
+7. Monitor timeRemaining in all API responses to track time left
+8. POST /move - Make strategic moves based on what you see (max 12)
+9. POST /mine - Mine valuable tiles for points (max 3 times)
+10. Repeat steps 8-9 until moves/mines exhausted OR timer expires
+11. GET /players - Check final scores and rankings
 
 STRATEGY TIPS
 =============
-- Map size scales with players: fewer players = smaller, more competitive maps
-- 1 player = 5×5 map (25 tiles), 2 players = 10×10 map (100 tiles), etc.
+- Map size is fixed per game and stored in contract - check it before playing
+- Smaller maps (fewer players) = more intense competition for tiles
+- Larger maps (more players) = more room to explore but more competition
 - Scout with moves to find rare tiles (worth 10 points each)
 - Save mines for the most valuable tiles you can find
 - Balance exploration vs mining - you only get 12 moves and 3 mines
 - Common tiles (1 point) may not be worth mining unless you're sure
 - Avoid mining tiles that are already depleted (value 0) - they give no points
-- On smaller maps (fewer players), competition for good tiles is more intense
-- On larger maps (more players), there's more room to explore but more competition
 - Work fast! You only have 90 seconds before the timer expires
 - Monitor timeRemaining in API responses to track how much time is left
 - Consider nearby tiles over distant exploration when time is running low
@@ -435,4 +463,32 @@ Example with curl:
 curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." http://localhost:8000/map
 
 All responses include "success": true on successful operations.
+
+CONTRACT FUNCTIONS FOR MAP SIZE
+===============================
+Frontend applications should use these contract functions to get map size:
+
+// Get map size for a specific game (only available after game is closed)
+const mapSize = await contract.getMapSize(gameId);
+
+// Get map size along with other commit/reveal state (only available after game is closed)
+const [
+  committedHash,
+  commitBlockNumber, 
+  revealValue,
+  randomHash,
+  hasCommitted,
+  hasRevealed,
+  mapSize
+] = await contract.getCommitRevealState(gameId);
+
+// Check if game is closed before getting map size:
+const [gamemaster, creator, stakeAmount, open, playerCount, hasOpened, hasClosed] = await contract.getGameInfo(gameId);
+
+if (hasClosed) {
+  const mapSize = await contract.getMapSize(gameId);
+  console.log(`Game ${gameId} uses a ${mapSize}x${mapSize} map`);
+} else {
+  console.log(`Game ${gameId} is still open for players to join. Map size will be calculated when closed.`);
+}
 

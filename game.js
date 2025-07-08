@@ -4,7 +4,7 @@ import https from "https";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { createClients, createPublicClientForChain } from "./clients.js";
-import { verifyMessage, keccak256, toBytes, toHex } from "viem";
+import { verifyMessage, keccak256, toBytes, toHex, concat } from "viem";
 import {
   DeterministicDice,
   GameLandGenerator,
@@ -32,9 +32,9 @@ function ensureSavedDirectory() {
 
 // Game phases enum
 const GamePhase = {
-  CREATED: "CREATED", // Game created, need to commit
-  COMMITTED: "COMMITTED", // Hash committed, waiting for close
-  CLOSED: "CLOSED", // Game closed, need to start server
+  CREATED: "CREATED", // Game created, need to commit hash
+  COMMITTED: "COMMITTED", // Hash committed, game open for players, waiting for close
+  CLOSED: "CLOSED", // Game closed, map size calculated, need to start server
   GAME_RUNNING: "GAME_RUNNING", // Game server running
   GAME_FINISHED: "GAME_FINISHED", // All players done, need payout
   PAYOUT_COMPLETE: "PAYOUT_COMPLETE", // Payout done, need reveal
@@ -76,6 +76,16 @@ const FULL_CONTRACT_ABI = [
   {
     anonymous: false,
     inputs: [{ indexed: true, name: "gameId", type: "uint256" }],
+    name: "GameOpened",
+    type: "event",
+  },
+  {
+    anonymous: false,
+    inputs: [
+      { indexed: true, name: "gameId", type: "uint256" },
+      { indexed: false, name: "startTime", type: "uint256" },
+      { indexed: false, name: "mapSize", type: "uint256" },
+    ],
     name: "GameClosed",
     type: "event",
   },
@@ -131,6 +141,7 @@ const FULL_CONTRACT_ABI = [
       { name: "_randomHash", type: "bytes32" },
       { name: "_hasCommitted", type: "bool" },
       { name: "_hasRevealed", type: "bool" },
+      { name: "_mapSize", type: "uint256" },
     ],
     stateMutability: "view",
     type: "function",
@@ -174,6 +185,20 @@ const FULL_CONTRACT_ABI = [
     name: "payout",
     outputs: [],
     stateMutability: "nonpayable",
+    type: "function",
+  },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getMapSize",
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getCommitBlockHash",
+    outputs: [{ name: "", type: "bytes32" }],
+    stateMutability: "view",
     type: "function",
   },
 ];
@@ -255,6 +280,35 @@ function loadRevealValue(gameId) {
   } catch (error) {
     throw new Error(
       `Failed to load ${SAVED_DIR}/reveal_${gameId}.txt: ${error.message}`
+    );
+  }
+}
+
+async function calculateRandomHash(gameId, revealValue) {
+  try {
+    log(`Calculating random hash for game ${gameId}...`, gameId);
+
+    // Get the commit block hash from the contract
+    const commitBlockHash = await globalPublicClient.readContract({
+      address: globalContractAddress,
+      abi: FULL_CONTRACT_ABI,
+      functionName: "getCommitBlockHash",
+      args: [BigInt(gameId)],
+    });
+
+    log(`Retrieved commit block hash: ${commitBlockHash}`, gameId);
+    log(`Using reveal value: ${revealValue.substring(0, 10)}...`, gameId);
+
+    // Calculate randomHash exactly as the contract will: keccak256(abi.encodePacked(blockHash, revealValue))
+    const randomHash = keccak256(concat([commitBlockHash, revealValue]));
+
+    log(`Calculated random hash: ${randomHash}`, gameId);
+    log(`This should match the contract's randomHash when revealed`, gameId);
+
+    return randomHash;
+  } catch (error) {
+    throw new Error(
+      `Failed to calculate random hash for game ${gameId}: ${error.message}`
     );
   }
 }
@@ -356,6 +410,7 @@ async function commitHashForGame(gameId) {
 
     if (receipt.status === "success") {
       log(`Commit successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
+      log(`Game is now open for players to join`, gameId);
       return true;
     } else {
       log(`Commit failed!`, gameId);
@@ -709,7 +764,7 @@ async function updateGameState(gameId) {
       args: [BigInt(gameId)],
     });
 
-    const [, , , , hasCommitted, hasRevealed] = commitState;
+    const [, , , , hasCommitted, hasRevealed, mapSize] = commitState;
 
     // Get payout state
     const payoutInfo = await globalPublicClient.readContract({
@@ -785,6 +840,7 @@ async function updateGameState(gameId) {
       hasCommitted,
       hasRevealed,
       hasPaidOut,
+      mapSize: Number(mapSize) || 0,
       phase,
       lastUpdated: Date.now(),
     });
@@ -920,14 +976,17 @@ async function processGamePhase(gameId) {
       break;
 
     case GamePhase.COMMITTED:
-      // Wait for game to be closed - only log occasionally
+      // Game is open for players to join, wait for game to be closed - only log occasionally
       if (shouldLogThisCycle && !needsAction) {
-        log(`⏳ Waiting for game to be closed by creator...`, gameId);
+        log(
+          `⏳ Game is open for players to join. Waiting for game to be closed by creator...`,
+          gameId
+        );
       }
       break;
 
     case GamePhase.CLOSED:
-      // Start game server - but only if no other server is running
+      // Game is closed, map size calculated, ready to start game server - but only if no other server is running
       if (activeGameServer === gameId) {
         log(`✅ Game server already running for this game`, gameId);
       } else if (activeGameServer !== null) {
@@ -1176,7 +1235,31 @@ async function startGameServer(gameId) {
       const revealValue = loadRevealValue(gameId);
       log(`✅ Found reveal value: ${revealValue.substring(0, 10)}...`, gameId);
 
-      // Get players first to determine map size
+      // Get map size from contract
+      const commitState = await globalPublicClient.readContract({
+        address: globalContractAddress,
+        abi: FULL_CONTRACT_ABI,
+        functionName: "getCommitRevealState",
+        args: [BigInt(gameId)],
+      });
+
+      const [, , , , hasCommitted, hasRevealed, mapSize] = commitState;
+
+      if (!hasCommitted) {
+        throw new Error("Hash not committed yet");
+      }
+
+      const contractMapSize = Number(mapSize);
+      if (contractMapSize <= 0) {
+        throw new Error("Invalid map size from contract");
+      }
+
+      log(
+        `🗺️ Using map size from contract: ${contractMapSize}x${contractMapSize}`,
+        gameId
+      );
+
+      // Get players for logging
       const contractPlayers = await globalPublicClient.readContract({
         address: globalContractAddress,
         abi: FULL_CONTRACT_ABI,
@@ -1184,14 +1267,14 @@ async function startGameServer(gameId) {
         args: [BigInt(gameId)],
       });
 
-      const calculatedMapSize = 1 + MAP_MULTIPLIER * contractPlayers.length;
-      log(
-        `🗺️ Generating ${calculatedMapSize}x${calculatedMapSize} map for ${contractPlayers.length} players...`,
-        gameId
-      );
+      log(`🎮 Generating map for ${contractPlayers.length} players...`, gameId);
 
-      const dice = new DeterministicDice(revealValue);
-      const mapGenerator = new GameLandGenerator(dice, calculatedMapSize);
+      // Calculate the randomHash that will be used for map generation
+      // This matches exactly what the contract will calculate when we call revealHash
+      const randomHash = await calculateRandomHash(gameId, revealValue);
+
+      const dice = new DeterministicDice(randomHash);
+      const mapGenerator = new GameLandGenerator(dice, contractMapSize);
 
       mapGenerator.generateLand();
       mapGenerator.placeStartingPosition();
@@ -1204,6 +1287,7 @@ async function startGameServer(gameId) {
           generated: new Date().toISOString(),
           gameId: gameId,
           revealValue: revealValue,
+          randomHash: randomHash,
         },
       };
 
@@ -1240,10 +1324,7 @@ async function startGameServer(gameId) {
         return false;
       }
     } catch (revealError) {
-      log(
-        `❌ Cannot start server - reveal file missing: ${revealError.message}`,
-        gameId
-      );
+      log(`❌ Cannot start server - error: ${revealError.message}`, gameId);
       log(`💡 Make sure the commit phase completed successfully`, gameId);
       return false;
     }
@@ -1482,11 +1563,21 @@ async function setupEventListeners() {
       onLogs: (logs) => {
         logs.forEach((eventLog) => {
           const gameId = eventLog.args.gameId.toString();
+          const startTime = eventLog.args.startTime;
+          const mapSize = eventLog.args.mapSize;
           const gameState = gameStates.get(gameId);
 
           if (gameState) {
             log(`🔒 Game closed! Game ID: ${gameId}`, gameId);
+            log(`📐 Map size calculated: ${mapSize}x${mapSize}`, gameId);
+            log(
+              `⏰ Game start time: ${new Date(
+                Number(startTime) * 1000
+              ).toISOString()}`,
+              gameId
+            );
             gameState.phase = GamePhase.CLOSED;
+            gameState.mapSize = Number(mapSize);
             gameState.lastUpdated = Date.now();
             gameStates.set(gameId, gameState);
           }
@@ -1514,11 +1605,33 @@ async function setupEventListeners() {
       },
     });
 
+    // Listen for GameOpened events (when game becomes open for players)
+    const unsubscribeGameOpened = globalPublicClient.watchContractEvent({
+      address: globalContractAddress,
+      abi: FULL_CONTRACT_ABI,
+      eventName: "GameOpened",
+      onLogs: (logs) => {
+        logs.forEach((eventLog) => {
+          const gameId = eventLog.args.gameId.toString();
+          const gameState = gameStates.get(gameId);
+
+          if (gameState) {
+            log(`🔓 Game opened for players! Game ID: ${gameId}`, gameId);
+            log(`👥 Players can now join the game`, gameId);
+            // Keep the COMMITTED phase since the game is waiting to be closed
+            gameState.lastUpdated = Date.now();
+            gameStates.set(gameId, gameState);
+          }
+        });
+      },
+    });
+
     log(`✅ Event listeners set up successfully`);
     return [
       unsubscribeGameCreated,
       unsubscribeGameClosed,
       unsubscribeHashCommitted,
+      unsubscribeGameOpened,
     ];
   } catch (error) {
     log(`❌ Error setting up event listeners: ${error.message}`);
@@ -1600,6 +1713,15 @@ function getCurrentMapSize() {
   if (gameMap && gameMap.size) {
     return gameMap.size;
   }
+
+  // If we have a current game ID, try to get map size from contract
+  if (currentGameId) {
+    const gameState = gameStates.get(currentGameId);
+    if (gameState && gameState.mapSize > 0) {
+      return gameState.mapSize;
+    }
+  }
+
   // Otherwise calculate based on current player count
   const playerCount = players.length;
   return playerCount > 0 ? 1 + MAP_MULTIPLIER * playerCount : 5; // Minimum 5x5
@@ -1722,9 +1844,15 @@ async function loadPlayersFromContract(gameId) {
     playerPositions.clear();
     playerStats.clear();
 
+    // Get map size from contract
+    const gameState = gameStates.get(gameId);
+    const mapSize =
+      gameState && gameState.mapSize > 0
+        ? gameState.mapSize
+        : getCurrentMapSize();
+
     // Generate player positions using the PlayerPositionGenerator
     const playerPositionGenerator = new PlayerPositionGenerator(revealSeed);
-    const mapSize = getCurrentMapSize();
 
     contractPlayers.forEach((playerAddress) => {
       const startPos = playerPositionGenerator.generateStartingPosition(
@@ -1886,7 +2014,7 @@ function getLocalMapView(playerAddress) {
     );
   }
 
-  return { view: localView, position, mapSize: gameMap.size };
+  return { view: localView, position };
 }
 
 function movePlayer(playerAddress, direction) {
@@ -2039,8 +2167,6 @@ app.get("/", (req, res) => {
     gameId: currentGameId,
     activeGames: safeJsonConvert(Array.from(gameStates.keys())),
     serverStatus: "running",
-    mapSize: getCurrentMapSize(),
-    mapMultiplier: MAP_MULTIPLIER,
     playerCount: players.length,
     timestamp: new Date().toISOString(),
     timer: {
@@ -2069,8 +2195,6 @@ app.get("/test", (req, res) => {
     timestamp: new Date().toISOString(),
     gameLoaded: gameMap !== null,
     playersCount: players.length,
-    mapSize: getCurrentMapSize(),
-    mapMultiplier: MAP_MULTIPLIER,
   });
 });
 
@@ -2170,7 +2294,6 @@ app.get("/map", authenticateToken, (req, res) => {
     player: req.playerAddress,
     localView: localView.view,
     position: localView.position,
-    mapSize: localView.mapSize,
     score: stats ? stats.score : 0,
     movesRemaining: stats ? stats.movesRemaining : 0,
     minesRemaining: stats ? stats.minesRemaining : 0,
@@ -2355,6 +2478,7 @@ app.get("/status", (req, res) => {
         hasCommitted: state.hasCommitted,
         hasRevealed: state.hasRevealed,
         hasPaidOut: state.hasPaidOut,
+        mapSize: state.mapSize || 0,
       }),
     ])
   );
@@ -2364,8 +2488,6 @@ app.get("/status", (req, res) => {
     gameId: currentGameId,
     activeGames: Array.from(gameStates.keys()),
     gameLoaded: gameMap !== null,
-    mapSize: getCurrentMapSize(),
-    mapMultiplier: MAP_MULTIPLIER,
     totalPlayers: players.length,
     players,
     serverTime: new Date().toISOString(),
@@ -2391,8 +2513,6 @@ app.get("/players", (req, res) => {
     players: playerData,
     count: playerData.length,
     timeRemaining: timeRemaining,
-    mapSize: getCurrentMapSize(),
-    mapMultiplier: MAP_MULTIPLIER,
   });
 });
 
@@ -2405,9 +2525,10 @@ async function initializeGameServer(gameId) {
     gameMap = loadGameMap(gameId);
     log(`✅ Game map loaded: ${gameMap.size}x${gameMap.size}`, gameId);
 
-    log(`🔑 Loading reveal seed...`, gameId);
-    revealSeed = loadRevealValue(gameId);
-    log(`✅ Reveal seed loaded: ${revealSeed.substring(0, 10)}...`, gameId);
+    log(`🔑 Loading reveal value and calculating random hash...`, gameId);
+    const revealValue = loadRevealValue(gameId);
+    revealSeed = await calculateRandomHash(gameId, revealValue);
+    log(`✅ Random hash calculated: ${revealSeed.substring(0, 10)}...`, gameId);
 
     // Load players
     log(`👥 Loading players from contract...`, gameId);
