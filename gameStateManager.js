@@ -419,7 +419,7 @@ export async function processGamePhase(
               `🛑 Delayed shutdown: Stopping game server for completed game ${gameId}`,
               gameId
             );
-            await stopGameServerFn();
+            await stopGameServerFn(gameId);
           } else {
             log(
               `⏭️ Skipping delayed shutdown - different game server now active`,
@@ -446,7 +446,7 @@ export async function processGamePhase(
       // Stop game server if this is the active game
       if (activeGameServer === gameId) {
         log(`🛑 Stopping game server for completed game ${gameId}`, gameId);
-        await stopGameServerFn();
+        await stopGameServerFn(gameId);
       }
 
       gameStates.delete(gameId);
@@ -490,16 +490,16 @@ export async function monitorGameProgress(
       return;
     }
 
-    const timeRemaining = getTimeRemaining();
-    if (timeRemaining <= 0 && getTimeRemaining !== null) {
+    const timeRemaining = getTimeRemaining(gameId);
+    if (timeRemaining <= 0 && getTimeRemaining(gameId) !== null) {
       log(`⏰ Timer expired! Force finishing game...`, gameId);
       forceFinishGameOnTimer(gameId);
-    } else if (getTimeRemaining !== null) {
+    } else if (getTimeRemaining(gameId) !== null) {
       const warningTimes = [60, 30, 10, 5];
       const currentTime = Math.floor(timeRemaining);
 
       if (warningTimes.includes(currentTime)) {
-        const warningKey = `timer_warning_${currentTime}`;
+        const warningKey = `timer_warning_${gameId}_${currentTime}`;
         if (!lastWaitingLogs.has(warningKey)) {
           log(`⏰ Timer warning: ${currentTime} seconds remaining!`, gameId);
           lastWaitingLogs.set(warningKey, Date.now());

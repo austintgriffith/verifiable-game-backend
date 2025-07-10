@@ -168,12 +168,17 @@ export async function storeCommitBlockHashForGame(
       return false;
     }
 
-    log(`Storing commit block hash...`, gameId);
+    // Generate the game server URL
+    const port = 8000 + parseInt(gameId);
+    const baseUrl = process.env.GAME_API_BASE || "http://localhost";
+    const gameServerUrl = `${baseUrl}:${port}`;
+
+    log(`Storing commit block hash with URL: ${gameServerUrl}`, gameId);
     const storeTxHash = await globalWalletClient.writeContract({
       address: globalContractAddress,
       abi: FULL_CONTRACT_ABI,
       functionName: "storeCommitBlockHash",
-      args: [BigInt(gameId)],
+      args: [BigInt(gameId), gameServerUrl],
     });
 
     log(`Store block hash transaction: ${storeTxHash}`, gameId);
@@ -187,6 +192,7 @@ export async function storeCommitBlockHashForGame(
         `Block hash stored successfully! Gas used: ${receipt.gasUsed.toString()}`,
         gameId
       );
+      log(`Game server URL stored in contract: ${gameServerUrl}`, gameId);
       log(`Commit phase fully completed - game ready for closure`, gameId);
       return true;
     } else {

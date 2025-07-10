@@ -21,6 +21,9 @@ import {
   initializeGameServer,
   cleanupGameServer,
   getCurrentPlayerData,
+  getActiveGameServers,
+  getGameServerInfo,
+  generateGameServerUrl,
 } from "./gameServer.js";
 import { processGamePhase, monitorGameProgress } from "./gameStateManager.js";
 import { scanForExistingGames, setupEventListeners } from "./eventListener.js";
@@ -33,10 +36,7 @@ dotenv.config();
 
 // Global state
 let gameStates = new Map();
-let activeGameServer = null;
-let currentGameId = null;
-let httpServer = null;
-let httpsServer = null;
+let activeGameServers = new Map(); // gameId -> { server, isHTTPS, port }
 let lastWaitingLogs = new Map();
 let payoutRetryCount = new Map();
 let payoutLastRetryTime = new Map();
@@ -134,6 +134,12 @@ async function startGameServer(gameId) {
       return false;
     }
 
+    // Check if server is already running for this game
+    if (activeGameServers.has(gameId)) {
+      log(`⚠️ Server already running for game ${gameId}`, gameId);
+      return true;
+    }
+
     // Check if reveal file exists
     try {
       const revealValue = loadRevealValue(gameId);
@@ -195,13 +201,7 @@ async function startGameServer(gameId) {
       gameId
     );
 
-    // Stop current server if running
-    if (activeGameServer) {
-      log(`🛑 Stopping current server for game ${activeGameServer}`, gameId);
-      await stopGameServer();
-    }
-
-    // Start new server
+    // Start new server (no need to stop existing servers)
     const serverResult = await initializeGameServer(
       gameId,
       globalPublicClient,
@@ -209,16 +209,21 @@ async function startGameServer(gameId) {
     );
 
     if (serverResult.server) {
-      activeGameServer = gameId;
-      currentGameId = gameId;
-      if (serverResult.isHTTPS) {
-        httpsServer = serverResult.server;
-      } else {
-        httpServer = serverResult.server;
-      }
+      const port = 8000 + parseInt(gameId);
+      activeGameServers.set(gameId, {
+        server: serverResult.server,
+        isHTTPS: serverResult.isHTTPS,
+        port: port,
+      });
 
       log(`✅ Game server started successfully for game ${gameId}!`, gameId);
-      log(`🌍 Server accessible at http://localhost:8000`, gameId);
+      log(
+        `🌍 Server accessible at ${generateGameServerUrl(
+          gameId,
+          serverResult.isHTTPS
+        )}`,
+        gameId
+      );
 
       const currentGameState = gameStates.get(gameId);
       if (currentGameState) {
@@ -247,46 +252,55 @@ async function startGameServer(gameId) {
   }
 }
 
-// Stop game server
-async function stopGameServer() {
-  if (httpServer) {
-    httpServer.close();
-    httpServer = null;
+// Stop game server for a specific game
+async function stopGameServer(gameId) {
+  if (!gameId) {
+    log(`⚠️ No gameId provided to stopGameServer`);
+    return;
   }
-  if (httpsServer) {
-    httpsServer.close();
-    httpsServer = null;
+
+  const serverInfo = activeGameServers.get(gameId);
+  if (serverInfo) {
+    if (serverInfo.server) {
+      serverInfo.server.close();
+    }
+    activeGameServers.delete(gameId);
+    log(`🛑 Game server stopped for game ${gameId}`, gameId);
   }
 
   // Clean up game server state
-  cleanupGameServer();
+  cleanupGameServer(gameId);
 
-  // Clean up timer warning keys
+  // Clean up timer warning keys for this specific game
   const keysToDelete = [];
   for (const [key, value] of lastWaitingLogs.entries()) {
     if (
-      key.startsWith("timer_warning_") ||
-      key.startsWith("payout_retry_") ||
-      key.startsWith("reveal_retry_") ||
-      key.startsWith("block_hash_waiting_") ||
-      key.startsWith("block_hash_action_") ||
-      key.startsWith("block_hash_start_")
+      key.startsWith(`timer_warning_${gameId}`) ||
+      key.startsWith(`payout_retry_${gameId}`) ||
+      key.startsWith(`reveal_retry_${gameId}`) ||
+      key.startsWith(`block_hash_waiting_${gameId}`) ||
+      key.startsWith(`block_hash_action_${gameId}`) ||
+      key.startsWith(`block_hash_start_${gameId}`)
     ) {
       keysToDelete.push(key);
     }
   }
   keysToDelete.forEach((key) => lastWaitingLogs.delete(key));
 
-  if (activeGameServer) {
-    revealRetryCount.delete(activeGameServer);
-    revealLastRetryTime.delete(activeGameServer);
-  }
+  // Clean up retry counts for this game
+  payoutRetryCount.delete(gameId);
+  payoutLastRetryTime.delete(gameId);
+  revealRetryCount.delete(gameId);
+  revealLastRetryTime.delete(gameId);
+}
 
-  if (activeGameServer) {
-    log(`Game server stopped for game ${activeGameServer}`, activeGameServer);
-    activeGameServer = null;
-    currentGameId = null;
+// Stop all game servers
+async function stopAllGameServers() {
+  const activeGameIds = Array.from(activeGameServers.keys());
+  for (const gameId of activeGameIds) {
+    await stopGameServer(gameId);
   }
+  log(`🛑 All game servers stopped`);
 }
 
 // Monitor game progress wrapper
@@ -317,7 +331,7 @@ async function monitorGameProgressWrapper(gameId) {
   // Call the generic monitor function
   await monitorGameProgress(
     gameId,
-    activeGameServer,
+    activeGameServers.has(gameId) ? gameId : null,
     gameStates,
     lastWaitingLogs
   );
@@ -372,7 +386,7 @@ async function gameLoop() {
           await processGamePhase(
             gameId,
             gameStates,
-            activeGameServer,
+            activeGameServers.has(gameId) ? gameId : null,
             globalPublicClient,
             globalWalletClient,
             globalContractAddress,
@@ -387,21 +401,26 @@ async function gameLoop() {
             stopGameServer
           );
 
-          // Check if the game was completed and server was stopped
-          if (!gameStates.has(gameId) && activeGameServer === gameId) {
-            activeGameServer = null;
-            currentGameId = null;
+          // Check if the game was completed and server should be stopped
+          if (!gameStates.has(gameId) && activeGameServers.has(gameId)) {
+            await stopGameServer(gameId);
           }
         }
 
-        const currentServerStatus = activeGameServer
-          ? `Game ${activeGameServer} on port 8000`
-          : "No active server";
+        // Generate server status summary
+        const activeServers = Array.from(activeGameServers.keys());
+        const currentServerStatus =
+          activeServers.length > 0
+            ? `${activeServers.length} active servers: [${activeServers
+                .map((id) => `${id}:${8000 + parseInt(id)}`)
+                .join(", ")}]`
+            : "No active servers";
+
         if (currentServerStatus !== lastServerStatus) {
-          if (activeGameServer) {
-            log(`🖥️  Active game server: ${currentServerStatus}`);
+          if (activeServers.length > 0) {
+            log(`🖥️  Active game servers: ${currentServerStatus}`);
           } else {
-            log(`💤 No active game server`);
+            log(`💤 No active game servers`);
           }
           lastServerStatus = currentServerStatus;
         }
@@ -457,6 +476,7 @@ async function main() {
 
     log(`🚀 Starting automated game management...`);
     log(`⏰ Processing games every 250ms...`);
+    log(`🔧 Each game will run on port 8000 + gameId`);
 
     if (gameStates.size > 0) {
       log(
@@ -477,19 +497,21 @@ async function main() {
 process.on("SIGINT", async () => {
   log("🛑 Shutting down gracefully...");
 
-  if (currentGameId) {
+  // Save scores for all active games
+  const activeGames = Array.from(activeGameServers.keys());
+  for (const gameId of activeGames) {
     try {
-      const playerData = getCurrentPlayerData(currentGameId);
+      const playerData = getCurrentPlayerData(gameId);
       if (playerData.length > 0) {
-        saveGameScores(currentGameId, playerData);
-        log(`💾 Saved final scores for game ${currentGameId}`);
+        saveGameScores(gameId, playerData);
+        log(`💾 Saved final scores for game ${gameId}`);
       }
     } catch (error) {
-      log(`Error saving scores: ${error.message}`);
+      log(`Error saving scores for game ${gameId}: ${error.message}`);
     }
   }
 
-  await stopGameServer();
+  await stopAllGameServers();
   log("👋 Shutdown complete");
   process.exit(0);
 });

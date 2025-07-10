@@ -97,6 +97,7 @@ export const FULL_CONTRACT_ABI = [
     inputs: [
       { indexed: true, name: "gameId", type: "uint256" },
       { indexed: false, name: "blockHash", type: "bytes32" },
+      { indexed: false, name: "url", type: "string" },
     ],
     name: "BlockHashStored",
     type: "event",
@@ -161,7 +162,10 @@ export const FULL_CONTRACT_ABI = [
     type: "function",
   },
   {
-    inputs: [{ name: "gameId", type: "uint256" }],
+    inputs: [
+      { name: "gameId", type: "uint256" },
+      { name: "_url", type: "string" },
+    ],
     name: "storeCommitBlockHash",
     outputs: [],
     stateMutability: "nonpayable",
@@ -191,6 +195,13 @@ export const FULL_CONTRACT_ABI = [
     inputs: [{ name: "gameId", type: "uint256" }],
     name: "getMapSize",
     outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+    type: "function",
+  },
+  {
+    inputs: [{ name: "gameId", type: "uint256" }],
+    name: "getGameUrl",
+    outputs: [{ name: "", type: "string" }],
     stateMutability: "view",
     type: "function",
   },

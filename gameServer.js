@@ -23,697 +23,855 @@ import {
   saveGameScores,
 } from "./fileService.js";
 
-// Express app instance
-const app = express();
+// Global registry of active game server instances
+const activeGameServers = new Map(); // gameId -> GameServerInstance
 
-// Game server state
-let gameMap = null;
-let players = [];
-let playerPositions = new Map();
-let playerStats = new Map();
-let revealSeed = null;
+// GameServerInstance class to encapsulate each game's state and methods
+class GameServerInstance {
+  constructor(gameId, globalPublicClient, globalContractAddress) {
+    this.gameId = gameId;
+    this.globalPublicClient = globalPublicClient;
+    this.globalContractAddress = globalContractAddress;
+    this.port = 8000 + parseInt(gameId);
 
-// Timer state
-let gameStartTime = null;
-let gameTimerInterval = null;
+    // Express app instance for this game
+    this.app = express();
 
-// Global references (will be injected)
-let globalPublicClient = null;
-let globalContractAddress = null;
-let currentGameId = null;
+    // Game server state
+    this.gameMap = null;
+    this.players = [];
+    this.playerPositions = new Map();
+    this.playerStats = new Map();
+    this.revealSeed = null;
 
-// Initialize global references
-export function initGameServerGlobals(publicClient, contractAddress, gameId) {
-  globalPublicClient = publicClient;
-  globalContractAddress = contractAddress;
-  currentGameId = gameId;
-}
+    // Timer state
+    this.gameStartTime = null;
+    this.gameTimerInterval = null;
 
-// Helper functions
-function getJWTSecret() {
-  if (!globalContractAddress) {
-    throw new Error("Contract address not initialized");
-  }
-  return BASE_JWT_SECRET + "-" + globalContractAddress.toLowerCase();
-}
+    // Server instances
+    this.httpServer = null;
+    this.httpsServer = null;
 
-function generateSignMessage(gameId, providedTimestamp = null) {
-  const timestamp = providedTimestamp || Date.now();
-  return `Sign this message to authenticate with the game server.\n\nContract: ${globalContractAddress}\nGameId: ${gameId}\nNamespace: ScriptGame\nTimestamp: ${timestamp}\n\nThis signature is valid for 5 minutes.`;
-}
-
-function isValidPlayer(address) {
-  return players.some(
-    (player) => player.toLowerCase() === address.toLowerCase()
-  );
-}
-
-function getCurrentMapSize() {
-  if (gameMap && gameMap.size) {
-    return gameMap.size;
+    // Initialize middleware and routes
+    this.initializeMiddleware();
+    this.initializeRoutes();
   }
 
-  const playerCount = players.length;
-  return playerCount > 0 ? 1 + MAP_MULTIPLIER * playerCount : 5;
-}
-
-function wrapCoordinate(coord, mapSize = null) {
-  const size = mapSize || getCurrentMapSize();
-  const result = ((coord % size) + size) % size;
-  return result;
-}
-
-export function getCurrentPlayerData(gameId) {
-  const playerData = [];
-  players.forEach((address) => {
-    const position = playerPositions.get(address.toLowerCase());
-    const stats = playerStats.get(address.toLowerCase());
-    if (position && stats) {
-      const wrappedX = wrapCoordinate(position.x, gameMap?.size);
-      const wrappedY = wrapCoordinate(position.y, gameMap?.size);
-
-      let tile = 0;
-      if (
-        gameMap &&
-        gameMap.land &&
-        gameMap.land[wrappedY] &&
-        gameMap.land[wrappedY][wrappedX] !== undefined
-      ) {
-        tile = gameMap.land[wrappedY][wrappedX];
-      }
-
-      playerData.push({
-        address,
-        position: { x: wrappedX, y: wrappedY },
-        tile,
-        score: stats.score,
-        movesRemaining: stats.movesRemaining,
-        minesRemaining: stats.minesRemaining,
-      });
+  getJWTSecret() {
+    if (!this.globalContractAddress) {
+      throw new Error("Contract address not initialized");
     }
-  });
-  return playerData;
-}
+    return BASE_JWT_SECRET + "-" + this.globalContractAddress.toLowerCase();
+  }
 
-function getSanitizedPlayerData(gameId) {
-  const playerData = [];
-  players.forEach((address) => {
-    const stats = playerStats.get(address.toLowerCase());
-    if (stats) {
-      playerData.push({
-        address,
-        score: stats.score,
-        movesRemaining: stats.movesRemaining,
-        minesRemaining: stats.minesRemaining,
-      });
-    }
-  });
-  return playerData;
-}
+  generateSignMessage(providedTimestamp = null) {
+    const timestamp = providedTimestamp || Date.now();
+    return `Sign this message to authenticate with the game server.\n\nContract: ${this.globalContractAddress}\nGameId: ${this.gameId}\nNamespace: ScriptGame\nTimestamp: ${timestamp}\n\nThis signature is valid for 5 minutes.`;
+  }
 
-export function getTimeRemaining() {
-  if (!gameStartTime) return 0;
-  const elapsed = Math.floor((Date.now() - gameStartTime) / 1000);
-  return Math.max(0, GAME_TIMER_DURATION - elapsed);
-}
-
-export function forceFinishGameOnTimer(gameId) {
-  log(`⏰ Timer expired! Force finishing game ${gameId}...`, gameId);
-
-  const playerData = getCurrentPlayerData(gameId);
-  log(`📊 Game ending due to timer - Current player stats:`, gameId);
-  playerData.forEach((player, index) => {
-    log(`  Player ${index + 1}: ${player.address}`, gameId);
-    log(
-      `    Score: ${player.score}, Moves: ${player.movesRemaining}, Mines: ${player.minesRemaining}`,
-      gameId
+  isValidPlayer(address) {
+    return this.players.some(
+      (player) => player.toLowerCase() === address.toLowerCase()
     );
-  });
-
-  players.forEach((address) => {
-    const stats = playerStats.get(address.toLowerCase());
-    if (stats) {
-      stats.movesRemaining = 0;
-      stats.minesRemaining = 0;
-      playerStats.set(address.toLowerCase(), stats);
-    }
-  });
-
-  log(
-    `🏁 All players' moves and mines set to 0 due to timer expiration`,
-    gameId
-  );
-
-  if (gameTimerInterval) {
-    clearTimeout(gameTimerInterval);
-    gameTimerInterval = null;
   }
-}
 
-async function loadPlayersFromContract(gameId) {
-  try {
-    const contractPlayers = await globalPublicClient.readContract({
-      address: globalContractAddress,
-      abi: FULL_CONTRACT_ABI,
-      functionName: "getPlayers",
-      args: [BigInt(gameId)],
+  getCurrentMapSize() {
+    if (this.gameMap && this.gameMap.size) {
+      return this.gameMap.size;
+    }
+    const playerCount = this.players.length;
+    return playerCount > 0 ? 1 + MAP_MULTIPLIER * playerCount : 5;
+  }
+
+  wrapCoordinate(coord, mapSize = null) {
+    const size = mapSize || this.getCurrentMapSize();
+    const result = ((coord % size) + size) % size;
+    return result;
+  }
+
+  getCurrentPlayerData() {
+    const playerData = [];
+    this.players.forEach((address) => {
+      const position = this.playerPositions.get(address.toLowerCase());
+      const stats = this.playerStats.get(address.toLowerCase());
+      if (position && stats) {
+        const wrappedX = this.wrapCoordinate(position.x, this.gameMap?.size);
+        const wrappedY = this.wrapCoordinate(position.y, this.gameMap?.size);
+
+        let tile = 0;
+        if (
+          this.gameMap &&
+          this.gameMap.land &&
+          this.gameMap.land[wrappedY] &&
+          this.gameMap.land[wrappedY][wrappedX] !== undefined
+        ) {
+          tile = this.gameMap.land[wrappedY][wrappedX];
+        }
+
+        playerData.push({
+          address,
+          position: { x: wrappedX, y: wrappedY },
+          tile,
+          score: stats.score,
+          movesRemaining: stats.movesRemaining,
+          minesRemaining: stats.minesRemaining,
+        });
+      }
+    });
+    return playerData;
+  }
+
+  getSanitizedPlayerData() {
+    const playerData = [];
+    this.players.forEach((address) => {
+      const stats = this.playerStats.get(address.toLowerCase());
+      if (stats) {
+        playerData.push({
+          address,
+          score: stats.score,
+          movesRemaining: stats.movesRemaining,
+          minesRemaining: stats.minesRemaining,
+        });
+      }
+    });
+    return playerData;
+  }
+
+  getTimeRemaining() {
+    if (!this.gameStartTime) return 0;
+    const elapsed = Math.floor((Date.now() - this.gameStartTime) / 1000);
+    return Math.max(0, GAME_TIMER_DURATION - elapsed);
+  }
+
+  forceFinishGameOnTimer() {
+    log(
+      `⏰ Timer expired! Force finishing game ${this.gameId}...`,
+      this.gameId
+    );
+
+    const playerData = this.getCurrentPlayerData();
+    log(`📊 Game ending due to timer - Current player stats:`, this.gameId);
+    playerData.forEach((player, index) => {
+      log(`  Player ${index + 1}: ${player.address}`, this.gameId);
+      log(
+        `    Score: ${player.score}, Moves: ${player.movesRemaining}, Mines: ${player.minesRemaining}`,
+        this.gameId
+      );
     });
 
-    players = contractPlayers;
-    playerPositions.clear();
-    playerStats.clear();
+    this.players.forEach((address) => {
+      const stats = this.playerStats.get(address.toLowerCase());
+      if (stats) {
+        stats.movesRemaining = 0;
+        stats.minesRemaining = 0;
+        this.playerStats.set(address.toLowerCase(), stats);
+      }
+    });
 
-    const mapSize = getCurrentMapSize();
-    const playerPositionGenerator = new PlayerPositionGenerator(revealSeed);
+    log(
+      `🏁 All players' moves and mines set to 0 due to timer expiration`,
+      this.gameId
+    );
 
-    contractPlayers.forEach((playerAddress) => {
-      const startPos = playerPositionGenerator.generateStartingPosition(
-        playerAddress,
-        gameId,
-        mapSize
+    if (this.gameTimerInterval) {
+      clearTimeout(this.gameTimerInterval);
+      this.gameTimerInterval = null;
+    }
+  }
+
+  async loadPlayersFromContract() {
+    try {
+      const contractPlayers = await this.globalPublicClient.readContract({
+        address: this.globalContractAddress,
+        abi: FULL_CONTRACT_ABI,
+        functionName: "getPlayers",
+        args: [BigInt(this.gameId)],
+      });
+
+      this.players = contractPlayers;
+      this.playerPositions.clear();
+      this.playerStats.clear();
+
+      const mapSize = this.getCurrentMapSize();
+      const playerPositionGenerator = new PlayerPositionGenerator(
+        this.revealSeed
       );
 
-      const wrappedPos = {
-        x: wrapCoordinate(startPos.x, mapSize),
-        y: wrapCoordinate(startPos.y, mapSize),
-      };
+      contractPlayers.forEach((playerAddress) => {
+        const startPos = playerPositionGenerator.generateStartingPosition(
+          playerAddress,
+          this.gameId,
+          mapSize
+        );
 
-      playerPositions.set(playerAddress.toLowerCase(), wrappedPos);
-      playerStats.set(playerAddress.toLowerCase(), {
-        score: 0,
-        movesRemaining: MAX_MOVES,
-        minesRemaining: MAX_MINES,
+        const wrappedPos = {
+          x: this.wrapCoordinate(startPos.x, mapSize),
+          y: this.wrapCoordinate(startPos.y, mapSize),
+        };
+
+        this.playerPositions.set(playerAddress.toLowerCase(), wrappedPos);
+        this.playerStats.set(playerAddress.toLowerCase(), {
+          score: 0,
+          movesRemaining: MAX_MOVES,
+          minesRemaining: MAX_MINES,
+        });
+      });
+
+      log(
+        `Loaded ${contractPlayers.length} players from contract`,
+        this.gameId
+      );
+      return true;
+    } catch (error) {
+      log(`Error loading players: ${error.message}`, this.gameId);
+      return false;
+    }
+  }
+
+  initializeMiddleware() {
+    this.app.use((req, res, next) => {
+      res.header("Access-Control-Allow-Origin", "*");
+      res.header(
+        "Access-Control-Allow-Methods",
+        "GET, POST, PUT, DELETE, OPTIONS"
+      );
+      res.header(
+        "Access-Control-Allow-Headers",
+        "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+      );
+      if (req.method === "OPTIONS") {
+        res.sendStatus(200);
+      } else {
+        next();
+      }
+    });
+
+    this.app.use(express.json());
+
+    this.app.set("json replacer", function (key, value) {
+      if (typeof value === "bigint") {
+        return Number(value);
+      }
+      return value;
+    });
+  }
+
+  authenticateToken = (req, res, next) => {
+    const authHeader = req.headers["authorization"];
+    const token = authHeader && authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).json({ error: "Access token required" });
+    }
+
+    jwt.verify(token, this.getJWTSecret(), (err, decoded) => {
+      if (err) {
+        return res.status(403).json({ error: "Invalid or expired token" });
+      }
+
+      if (!this.isValidPlayer(decoded.address)) {
+        return res.status(403).json({ error: "Player no longer registered" });
+      }
+
+      req.playerAddress = decoded.address;
+      next();
+    });
+  };
+
+  getLocalMapView(playerAddress) {
+    const position = this.playerPositions.get(playerAddress.toLowerCase());
+    if (!position) {
+      return null;
+    }
+
+    const localView = [];
+    const { x: centerX, y: centerY } = position;
+
+    for (let dy = -1; dy <= 1; dy++) {
+      const row = [];
+      for (let dx = -1; dx <= 1; dx++) {
+        const mapX = this.wrapCoordinate(centerX + dx, this.gameMap.size);
+        const mapY = this.wrapCoordinate(centerY + dy, this.gameMap.size);
+        const tile = this.gameMap.land[mapY][mapX];
+
+        if (dx === 0 && dy === 0) {
+          row.push({ tile, player: true, coordinates: { x: mapX, y: mapY } });
+        } else {
+          row.push({ tile, player: false, coordinates: { x: mapX, y: mapY } });
+        }
+      }
+      localView.push(row);
+    }
+
+    return { view: localView, position };
+  }
+
+  movePlayer(playerAddress, direction) {
+    const currentPos = this.playerPositions.get(playerAddress.toLowerCase());
+    if (!currentPos) {
+      return { success: false, error: "Player not found" };
+    }
+
+    const stats = this.playerStats.get(playerAddress.toLowerCase());
+    if (!stats) {
+      return { success: false, error: "Player stats not found" };
+    }
+
+    if (stats.movesRemaining <= 0)
+      return { success: false, error: "No moves remaining" };
+
+    if (typeof direction !== "string") {
+      return { success: false, error: "Direction must be a string" };
+    }
+
+    const normalizedDirection = direction.toLowerCase().trim();
+    const dirVector = DIRECTIONS[normalizedDirection];
+    if (!dirVector) {
+      return { success: false, error: "Invalid direction" };
+    }
+
+    const newX = this.wrapCoordinate(
+      currentPos.x + dirVector.x,
+      this.gameMap.size
+    );
+    const newY = this.wrapCoordinate(
+      currentPos.y + dirVector.y,
+      this.gameMap.size
+    );
+
+    this.playerPositions.set(playerAddress.toLowerCase(), { x: newX, y: newY });
+    stats.movesRemaining--;
+    this.playerStats.set(playerAddress.toLowerCase(), stats);
+
+    const result = {
+      success: true,
+      newPosition: { x: newX, y: newY },
+      tile: this.gameMap.land[newY][newX],
+      movesRemaining: stats.movesRemaining,
+      minesRemaining: stats.minesRemaining,
+      score: stats.score,
+    };
+
+    return result;
+  }
+
+  minePlayer(playerAddress) {
+    const currentPos = this.playerPositions.get(playerAddress.toLowerCase());
+    if (!currentPos) {
+      return { success: false, error: "Player not found" };
+    }
+
+    const stats = this.playerStats.get(playerAddress.toLowerCase());
+    if (!stats) {
+      return { success: false, error: "Player stats not found" };
+    }
+
+    if (stats.minesRemaining <= 0)
+      return { success: false, error: "No mines remaining" };
+
+    const currentTile = this.gameMap.land[currentPos.y][currentPos.x];
+    if (currentTile === 0)
+      return { success: false, error: "Tile already mined" };
+
+    const pointsEarned = TILE_POINTS[currentTile] || 0;
+    stats.score += pointsEarned;
+    stats.minesRemaining--;
+    this.playerStats.set(playerAddress.toLowerCase(), stats);
+
+    this.gameMap.land[currentPos.y][currentPos.x] = 0;
+
+    const result = {
+      success: true,
+      position: currentPos,
+      tile: currentTile,
+      pointsEarned,
+      totalScore: stats.score,
+      minesRemaining: stats.minesRemaining,
+      movesRemaining: stats.movesRemaining,
+    };
+
+    return result;
+  }
+
+  initializeRoutes() {
+    // API Routes
+    this.app.get("/", (req, res) => {
+      const timeRemaining = this.getTimeRemaining();
+      const gameActive = this.gameStartTime !== null;
+
+      res.json({
+        success: true,
+        message: "Automated Game Server",
+        version: "2.0.0",
+        gameId: this.gameId,
+        port: this.port,
+        serverStatus: "running",
+        playerCount: this.players.length,
+        timestamp: new Date().toISOString(),
+        timer: {
+          active: gameActive,
+          duration: GAME_TIMER_DURATION,
+          timeRemaining: timeRemaining,
+        },
+        endpoints: {
+          register: "/register",
+          map: "/map (requires auth)",
+          move: "/move (requires auth)",
+          mine: "/mine (requires auth)",
+          status: "/status",
+          players: "/players",
+          test: "/test",
+        },
       });
     });
 
-    log(`Loaded ${contractPlayers.length} players from contract`, gameId);
-    return true;
-  } catch (error) {
-    log(`Error loading players: ${error.message}`, gameId);
-    return false;
-  }
-}
+    this.app.get("/test", (req, res) => {
+      res.json({
+        success: true,
+        message: "Server is running!",
+        gameId: this.gameId,
+        port: this.port,
+        timestamp: new Date().toISOString(),
+        gameLoaded: this.gameMap !== null,
+        playersCount: this.players.length,
+      });
+    });
 
-// Express middleware
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
-  );
-  if (req.method === "OPTIONS") {
-    res.sendStatus(200);
-  } else {
-    next();
-  }
-});
+    this.app.get("/register", (req, res) => {
+      const timestamp = Date.now();
+      const message = this.generateSignMessage(timestamp);
 
-app.use(express.json());
+      res.json({
+        success: true,
+        message,
+        timestamp,
+        gameId: this.gameId,
+        instructions:
+          "Sign this message with your Ethereum wallet to authenticate",
+      });
+    });
 
-app.set("json replacer", function (key, value) {
-  if (typeof value === "bigint") {
-    return Number(value);
-  }
-  return value;
-});
+    this.app.post("/register", async (req, res) => {
+      const { signature, address, timestamp } = req.body;
 
-// Authentication middleware
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1];
-
-  if (!token) {
-    return res.status(401).json({ error: "Access token required" });
-  }
-
-  jwt.verify(token, getJWTSecret(), (err, decoded) => {
-    if (err) {
-      return res.status(403).json({ error: "Invalid or expired token" });
-    }
-
-    if (!isValidPlayer(decoded.address)) {
-      return res.status(403).json({ error: "Player no longer registered" });
-    }
-
-    req.playerAddress = decoded.address;
-    next();
-  });
-}
-
-// Game logic functions
-function getLocalMapView(playerAddress) {
-  const position = playerPositions.get(playerAddress.toLowerCase());
-  if (!position) {
-    return null;
-  }
-
-  const localView = [];
-  const { x: centerX, y: centerY } = position;
-
-  for (let dy = -1; dy <= 1; dy++) {
-    const row = [];
-    for (let dx = -1; dx <= 1; dx++) {
-      const mapX = wrapCoordinate(centerX + dx, gameMap.size);
-      const mapY = wrapCoordinate(centerY + dy, gameMap.size);
-      const tile = gameMap.land[mapY][mapX];
-
-      if (dx === 0 && dy === 0) {
-        row.push({ tile, player: true, coordinates: { x: mapX, y: mapY } });
-      } else {
-        row.push({ tile, player: false, coordinates: { x: mapX, y: mapY } });
+      if (!signature || !address || !timestamp) {
+        return res.status(400).json({
+          error: "Signature, address, and timestamp are required",
+        });
       }
+
+      if (!this.isValidPlayer(address)) {
+        return res.status(403).json({
+          error: "Address is not registered as a player",
+        });
+      }
+
+      try {
+        const message = this.generateSignMessage(parseInt(timestamp));
+        const isValid = await verifyMessage({
+          address,
+          message,
+          signature,
+        });
+
+        if (!isValid) {
+          return res.status(401).json({ error: "Invalid signature" });
+        }
+
+        const tokenPayload = {
+          address: address.toLowerCase(),
+          timestamp: Date.now(),
+        };
+
+        const token = jwt.sign(tokenPayload, this.getJWTSecret(), {
+          expiresIn: JWT_EXPIRES_IN,
+        });
+
+        res.json({
+          success: true,
+          token,
+          expiresIn: JWT_EXPIRES_IN,
+          message: "Authentication successful",
+        });
+      } catch (error) {
+        res.status(500).json({ error: "Failed to verify signature" });
+      }
+    });
+
+    this.app.get("/map", this.authenticateToken, (req, res) => {
+      const localView = this.getLocalMapView(req.playerAddress);
+      if (!localView) {
+        return res.status(404).json({ error: "Player not found" });
+      }
+
+      const stats = this.playerStats.get(req.playerAddress.toLowerCase());
+      const timeRemaining = this.getTimeRemaining();
+
+      const response = {
+        success: true,
+        player: req.playerAddress,
+        localView: localView.view,
+        position: localView.position,
+        score: stats ? stats.score : 0,
+        movesRemaining: stats ? stats.movesRemaining : 0,
+        minesRemaining: stats ? stats.minesRemaining : 0,
+        timeRemaining: timeRemaining,
+        legend: {
+          0: "Depleted (already mined)",
+          1: "Common (1 point)",
+          2: "Uncommon (5 points)",
+          3: "Rare (10 points)",
+          X: "Treasure!!! (25 points)",
+        },
+      };
+
+      res.json(response);
+    });
+
+    this.app.post("/move", this.authenticateToken, (req, res) => {
+      const { direction } = req.body;
+
+      if (!direction) {
+        return res.status(400).json({ error: "Direction required" });
+      }
+
+      const timeRemaining = this.getTimeRemaining();
+      if (timeRemaining <= 0) {
+        return res.status(400).json({ error: "Time expired! Game over." });
+      }
+
+      const moveResult = this.movePlayer(req.playerAddress, direction);
+      if (!moveResult.success) {
+        return res.status(400).json({ error: moveResult.error });
+      }
+
+      const localView = this.getLocalMapView(req.playerAddress);
+
+      const response = {
+        success: true,
+        player: req.playerAddress,
+        direction,
+        newPosition: moveResult.newPosition,
+        tile: moveResult.tile,
+        localView: localView.view,
+        score: moveResult.score,
+        movesRemaining: moveResult.movesRemaining,
+        minesRemaining: moveResult.minesRemaining,
+        timeRemaining: timeRemaining,
+        validDirections: Object.keys(DIRECTIONS),
+      };
+
+      res.json(response);
+    });
+
+    this.app.post("/mine", this.authenticateToken, (req, res) => {
+      const timeRemaining = this.getTimeRemaining();
+      if (timeRemaining <= 0) {
+        return res.status(400).json({ error: "Time expired! Game over." });
+      }
+
+      const mineResult = this.minePlayer(req.playerAddress);
+      if (!mineResult.success) {
+        return res.status(400).json({ error: mineResult.error });
+      }
+
+      const localView = this.getLocalMapView(req.playerAddress);
+
+      const response = {
+        success: true,
+        player: req.playerAddress,
+        position: mineResult.position,
+        tile: mineResult.tile,
+        pointsEarned: mineResult.pointsEarned,
+        totalScore: mineResult.totalScore,
+        movesRemaining: mineResult.movesRemaining,
+        minesRemaining: mineResult.minesRemaining,
+        timeRemaining: timeRemaining,
+        localView: localView.view,
+      };
+
+      res.json(response);
+    });
+
+    this.app.get("/status", (req, res) => {
+      const timeRemaining = this.getTimeRemaining();
+      const gameActive = this.gameStartTime !== null;
+
+      res.json({
+        success: true,
+        gameId: this.gameId,
+        port: this.port,
+        gameLoaded: this.gameMap !== null,
+        totalPlayers: this.players.length,
+        players: this.players,
+        serverTime: new Date().toISOString(),
+        timer: {
+          active: gameActive,
+          duration: GAME_TIMER_DURATION,
+          timeRemaining: timeRemaining,
+          timeElapsed: gameActive ? GAME_TIMER_DURATION - timeRemaining : 0,
+          startTime: this.gameStartTime,
+        },
+      });
+    });
+
+    this.app.get("/players", (req, res) => {
+      const playerData = this.getSanitizedPlayerData();
+      const timeRemaining = this.getTimeRemaining();
+
+      res.json({
+        success: true,
+        gameId: this.gameId,
+        players: playerData,
+        count: playerData.length,
+        timeRemaining: timeRemaining,
+      });
+    });
+  }
+
+  async startServer() {
+    try {
+      log(`📂 Loading game map...`, this.gameId);
+      this.gameMap = loadGameMap(this.gameId);
+      log(
+        `✅ Game map loaded: ${this.gameMap.size}x${this.gameMap.size}`,
+        this.gameId
+      );
+
+      log(
+        `🔑 Loading reveal value and calculating random hash...`,
+        this.gameId
+      );
+      const revealValue = loadRevealValue(this.gameId);
+      this.revealSeed = await calculateRandomHash(
+        this.gameId,
+        revealValue,
+        this.globalPublicClient,
+        this.globalContractAddress,
+        FULL_CONTRACT_ABI
+      );
+      log(
+        `✅ Random hash calculated: ${this.revealSeed.substring(0, 10)}...`,
+        this.gameId
+      );
+
+      log(`👥 Loading players from contract...`, this.gameId);
+      const playersLoaded = await this.loadPlayersFromContract();
+      if (!playersLoaded) {
+        log(`❌ Failed to load players from contract`, this.gameId);
+        return { server: null, isHTTPS: false };
+      }
+      log(`✅ Loaded ${this.players.length} players`, this.gameId);
+
+      this.gameStartTime = Date.now();
+      log(
+        `⏰ Game timer started - players have ${GAME_TIMER_DURATION} seconds`,
+        this.gameId
+      );
+
+      this.gameTimerInterval = setTimeout(() => {
+        log(
+          `⏰ Timer expired! Auto-finishing game ${this.gameId}`,
+          this.gameId
+        );
+        this.forceFinishGameOnTimer();
+      }, GAME_TIMER_DURATION * 1000);
+
+      const hasSSL =
+        fs.existsSync("server.key") && fs.existsSync("server.cert");
+      log(`🔒 SSL available: ${hasSSL}`, this.gameId);
+
+      return new Promise((resolve) => {
+        if (hasSSL) {
+          try {
+            log(
+              `🔐 Setting up HTTPS server on port ${this.port}...`,
+              this.gameId
+            );
+            const httpsOptions = {
+              key: fs.readFileSync("server.key"),
+              cert: fs.readFileSync("server.cert"),
+            };
+            this.httpsServer = https.createServer(httpsOptions, this.app);
+            this.httpsServer.listen(this.port, "0.0.0.0", () => {
+              log(
+                `🚀 HTTPS Game Server running on port ${this.port}`,
+                this.gameId
+              );
+              log(`🌍 Access at: https://localhost:${this.port}`, this.gameId);
+              resolve({ server: this.httpsServer, isHTTPS: true });
+            });
+            this.httpsServer.on("error", (error) => {
+              log(`❌ HTTPS server error: ${error.message}`, this.gameId);
+              resolve({ server: null, isHTTPS: false });
+            });
+          } catch (error) {
+            log(
+              `❌ SSL setup failed, falling back to HTTP: ${error.message}`,
+              this.gameId
+            );
+            this.httpServer = this.app.listen(this.port, "0.0.0.0", () => {
+              log(
+                `🚀 HTTP Game Server running on port ${this.port}`,
+                this.gameId
+              );
+              log(`🌍 Access at: http://localhost:${this.port}`, this.gameId);
+              resolve({ server: this.httpServer, isHTTPS: false });
+            });
+            this.httpServer.on("error", (error) => {
+              log(`❌ HTTP server error: ${error.message}`, this.gameId);
+              resolve({ server: null, isHTTPS: false });
+            });
+          }
+        } else {
+          log(`🌐 Setting up HTTP server on port ${this.port}...`, this.gameId);
+          this.httpServer = this.app.listen(this.port, "0.0.0.0", () => {
+            log(
+              `🚀 HTTP Game Server running on port ${this.port}`,
+              this.gameId
+            );
+            log(`🌍 Access at: http://localhost:${this.port}`, this.gameId);
+            resolve({ server: this.httpServer, isHTTPS: false });
+          });
+          this.httpServer.on("error", (error) => {
+            log(`❌ HTTP server error: ${error.message}`, this.gameId);
+            resolve({ server: null, isHTTPS: false });
+          });
+        }
+      });
+    } catch (error) {
+      log(`❌ Error starting game server: ${error.message}`, this.gameId);
+      log(`📍 Stack trace: ${error.stack}`, this.gameId);
+      return { server: null, isHTTPS: false };
     }
-    localView.push(row);
   }
 
-  return { view: localView, position };
-}
-
-function movePlayer(playerAddress, direction) {
-  const currentPos = playerPositions.get(playerAddress.toLowerCase());
-  if (!currentPos) {
-    return { success: false, error: "Player not found" };
-  }
-
-  const stats = playerStats.get(playerAddress.toLowerCase());
-  if (!stats) {
-    return { success: false, error: "Player stats not found" };
-  }
-
-  if (stats.movesRemaining <= 0)
-    return { success: false, error: "No moves remaining" };
-
-  if (typeof direction !== "string") {
-    return { success: false, error: "Direction must be a string" };
-  }
-
-  const normalizedDirection = direction.toLowerCase().trim();
-  const dirVector = DIRECTIONS[normalizedDirection];
-  if (!dirVector) {
-    return { success: false, error: "Invalid direction" };
-  }
-
-  const newX = wrapCoordinate(currentPos.x + dirVector.x, gameMap.size);
-  const newY = wrapCoordinate(currentPos.y + dirVector.y, gameMap.size);
-
-  playerPositions.set(playerAddress.toLowerCase(), { x: newX, y: newY });
-  stats.movesRemaining--;
-  playerStats.set(playerAddress.toLowerCase(), stats);
-
-  const result = {
-    success: true,
-    newPosition: { x: newX, y: newY },
-    tile: gameMap.land[newY][newX],
-    movesRemaining: stats.movesRemaining,
-    minesRemaining: stats.minesRemaining,
-    score: stats.score,
-  };
-
-  return result;
-}
-
-function minePlayer(playerAddress) {
-  const currentPos = playerPositions.get(playerAddress.toLowerCase());
-  if (!currentPos) {
-    return { success: false, error: "Player not found" };
-  }
-
-  const stats = playerStats.get(playerAddress.toLowerCase());
-  if (!stats) {
-    return { success: false, error: "Player stats not found" };
-  }
-
-  if (stats.minesRemaining <= 0)
-    return { success: false, error: "No mines remaining" };
-
-  const currentTile = gameMap.land[currentPos.y][currentPos.x];
-  if (currentTile === 0) return { success: false, error: "Tile already mined" };
-
-  const pointsEarned = TILE_POINTS[currentTile] || 0;
-  stats.score += pointsEarned;
-  stats.minesRemaining--;
-  playerStats.set(playerAddress.toLowerCase(), stats);
-
-  gameMap.land[currentPos.y][currentPos.x] = 0;
-
-  const result = {
-    success: true,
-    position: currentPos,
-    tile: currentTile,
-    pointsEarned,
-    totalScore: stats.score,
-    minesRemaining: stats.minesRemaining,
-    movesRemaining: stats.movesRemaining,
-  };
-
-  return result;
-}
-
-// API Routes
-app.get("/", (req, res) => {
-  const timeRemaining = getTimeRemaining();
-  const gameActive = gameStartTime !== null;
-
-  res.json({
-    success: true,
-    message: "Automated Game Server",
-    version: "2.0.0",
-    gameId: currentGameId,
-    serverStatus: "running",
-    playerCount: players.length,
-    timestamp: new Date().toISOString(),
-    timer: {
-      active: gameActive,
-      duration: GAME_TIMER_DURATION,
-      timeRemaining: timeRemaining,
-    },
-    endpoints: {
-      register: "/register",
-      map: "/map (requires auth)",
-      move: "/move (requires auth)",
-      mine: "/mine (requires auth)",
-      status: "/status",
-      players: "/players",
-      test: "/test",
-    },
-  });
-});
-
-app.get("/test", (req, res) => {
-  res.json({
-    success: true,
-    message: "Server is running!",
-    gameId: currentGameId,
-    timestamp: new Date().toISOString(),
-    gameLoaded: gameMap !== null,
-    playersCount: players.length,
-  });
-});
-
-app.get("/register", (req, res) => {
-  const timestamp = Date.now();
-  const message = generateSignMessage(currentGameId, timestamp);
-
-  res.json({
-    success: true,
-    message,
-    timestamp,
-    gameId: currentGameId,
-    instructions: "Sign this message with your Ethereum wallet to authenticate",
-  });
-});
-
-app.post("/register", async (req, res) => {
-  const { signature, address, timestamp } = req.body;
-
-  if (!signature || !address || !timestamp) {
-    return res.status(400).json({
-      error: "Signature, address, and timestamp are required",
-    });
-  }
-
-  if (!isValidPlayer(address)) {
-    return res.status(403).json({
-      error: "Address is not registered as a player",
-    });
-  }
-
-  try {
-    const message = generateSignMessage(currentGameId, parseInt(timestamp));
-    const isValid = await verifyMessage({
-      address,
-      message,
-      signature,
-    });
-
-    if (!isValid) {
-      return res.status(401).json({ error: "Invalid signature" });
+  cleanup() {
+    if (this.httpServer) {
+      this.httpServer.close();
+      this.httpServer = null;
+    }
+    if (this.httpsServer) {
+      this.httpsServer.close();
+      this.httpsServer = null;
     }
 
-    const tokenPayload = {
-      address: address.toLowerCase(),
-      timestamp: Date.now(),
-    };
+    this.gameMap = null;
+    this.players = [];
+    this.playerPositions.clear();
+    this.playerStats.clear();
+    this.revealSeed = null;
+    this.gameStartTime = null;
 
-    const token = jwt.sign(tokenPayload, getJWTSecret(), {
-      expiresIn: JWT_EXPIRES_IN,
-    });
+    if (this.gameTimerInterval) {
+      clearTimeout(this.gameTimerInterval);
+      this.gameTimerInterval = null;
+    }
 
-    res.json({
-      success: true,
-      token,
-      expiresIn: JWT_EXPIRES_IN,
-      message: "Authentication successful",
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to verify signature" });
+    log(`Game server cleanup completed for game ${this.gameId}`, this.gameId);
   }
-});
+}
 
-app.get("/map", authenticateToken, (req, res) => {
-  const localView = getLocalMapView(req.playerAddress);
-  if (!localView) {
-    return res.status(404).json({ error: "Player not found" });
-  }
-
-  const stats = playerStats.get(req.playerAddress.toLowerCase());
-  const timeRemaining = getTimeRemaining();
-
-  const response = {
-    success: true,
-    player: req.playerAddress,
-    localView: localView.view,
-    position: localView.position,
-    score: stats ? stats.score : 0,
-    movesRemaining: stats ? stats.movesRemaining : 0,
-    minesRemaining: stats ? stats.minesRemaining : 0,
-    timeRemaining: timeRemaining,
-    legend: {
-      0: "Depleted (already mined)",
-      1: "Common (1 point)",
-      2: "Uncommon (5 points)",
-      3: "Rare (10 points)",
-      X: "Treasure!!! (25 points)",
-    },
-  };
-
-  res.json(response);
-});
-
-app.post("/move", authenticateToken, (req, res) => {
-  const { direction } = req.body;
-
-  if (!direction) {
-    return res.status(400).json({ error: "Direction required" });
-  }
-
-  const timeRemaining = getTimeRemaining();
-  if (timeRemaining <= 0) {
-    return res.status(400).json({ error: "Time expired! Game over." });
-  }
-
-  const moveResult = movePlayer(req.playerAddress, direction);
-  if (!moveResult.success) {
-    return res.status(400).json({ error: moveResult.error });
-  }
-
-  const localView = getLocalMapView(req.playerAddress);
-
-  const response = {
-    success: true,
-    player: req.playerAddress,
-    direction,
-    newPosition: moveResult.newPosition,
-    tile: moveResult.tile,
-    localView: localView.view,
-    score: moveResult.score,
-    movesRemaining: moveResult.movesRemaining,
-    minesRemaining: moveResult.minesRemaining,
-    timeRemaining: timeRemaining,
-    validDirections: Object.keys(DIRECTIONS),
-  };
-
-  res.json(response);
-});
-
-app.post("/mine", authenticateToken, (req, res) => {
-  const timeRemaining = getTimeRemaining();
-  if (timeRemaining <= 0) {
-    return res.status(400).json({ error: "Time expired! Game over." });
-  }
-
-  const mineResult = minePlayer(req.playerAddress);
-  if (!mineResult.success) {
-    return res.status(400).json({ error: mineResult.error });
-  }
-
-  const localView = getLocalMapView(req.playerAddress);
-
-  const response = {
-    success: true,
-    player: req.playerAddress,
-    position: mineResult.position,
-    tile: mineResult.tile,
-    pointsEarned: mineResult.pointsEarned,
-    totalScore: mineResult.totalScore,
-    movesRemaining: mineResult.movesRemaining,
-    minesRemaining: mineResult.minesRemaining,
-    timeRemaining: timeRemaining,
-    localView: localView.view,
-  };
-
-  res.json(response);
-});
-
-app.get("/status", (req, res) => {
-  const timeRemaining = getTimeRemaining();
-  const gameActive = gameStartTime !== null;
-
-  res.json({
-    success: true,
-    gameId: currentGameId,
-    gameLoaded: gameMap !== null,
-    totalPlayers: players.length,
-    players,
-    serverTime: new Date().toISOString(),
-    timer: {
-      active: gameActive,
-      duration: GAME_TIMER_DURATION,
-      timeRemaining: timeRemaining,
-      timeElapsed: gameActive ? GAME_TIMER_DURATION - timeRemaining : 0,
-      startTime: gameStartTime,
-    },
-  });
-});
-
-app.get("/players", (req, res) => {
-  const playerData = getSanitizedPlayerData(currentGameId);
-  const timeRemaining = getTimeRemaining();
-
-  res.json({
-    success: true,
-    gameId: currentGameId,
-    players: playerData,
-    count: playerData.length,
-    timeRemaining: timeRemaining,
-  });
-});
-
-// Game server initialization
+// Public API functions for managing multiple game servers
 export async function initializeGameServer(
   gameId,
   globalPublicClient,
   globalContractAddress
 ) {
   try {
-    log(`🔧 Initializing game server for game ${gameId}...`, gameId);
-
-    // Initialize global references
-    initGameServerGlobals(globalPublicClient, globalContractAddress, gameId);
-
-    log(`📂 Loading game map...`, gameId);
-    gameMap = loadGameMap(gameId);
-    log(`✅ Game map loaded: ${gameMap.size}x${gameMap.size}`, gameId);
-
-    log(`🔑 Loading reveal value and calculating random hash...`, gameId);
-    const revealValue = loadRevealValue(gameId);
-    revealSeed = await calculateRandomHash(
-      gameId,
-      revealValue,
-      globalPublicClient,
-      globalContractAddress,
-      FULL_CONTRACT_ABI
-    );
-    log(`✅ Random hash calculated: ${revealSeed.substring(0, 10)}...`, gameId);
-
-    log(`👥 Loading players from contract...`, gameId);
-    const playersLoaded = await loadPlayersFromContract(gameId);
-    if (!playersLoaded) {
-      log(`❌ Failed to load players from contract`, gameId);
-      return false;
-    }
-    log(`✅ Loaded ${players.length} players`, gameId);
-
-    gameStartTime = Date.now();
     log(
-      `⏰ Game timer started - players have ${GAME_TIMER_DURATION} seconds`,
+      `🔧 Initializing game server for game ${gameId} on port ${
+        8000 + parseInt(gameId)
+      }...`,
       gameId
     );
 
-    gameTimerInterval = setTimeout(() => {
-      log(`⏰ Timer expired! Auto-finishing game ${gameId}`, gameId);
-      forceFinishGameOnTimer(gameId);
-    }, GAME_TIMER_DURATION * 1000);
+    // Create new game server instance
+    const gameServerInstance = new GameServerInstance(
+      gameId,
+      globalPublicClient,
+      globalContractAddress
+    );
 
-    const PORT = 8000;
-    const hasSSL = fs.existsSync("server.key") && fs.existsSync("server.cert");
-    log(`🔒 SSL available: ${hasSSL}`, gameId);
+    // Start the server
+    const serverResult = await gameServerInstance.startServer();
 
-    return new Promise((resolve) => {
-      if (hasSSL) {
-        try {
-          log(`🔐 Setting up HTTPS server...`, gameId);
-          const httpsOptions = {
-            key: fs.readFileSync("server.key"),
-            cert: fs.readFileSync("server.cert"),
-          };
-          const httpsServer = https.createServer(httpsOptions, app);
-          httpsServer.listen(PORT, "0.0.0.0", () => {
-            log(`🚀 HTTPS Game Server running on port ${PORT}`, gameId);
-            log(`🌍 Access at: https://localhost:${PORT}`, gameId);
-            resolve({ server: httpsServer, isHTTPS: true });
-          });
-          httpsServer.on("error", (error) => {
-            log(`❌ HTTPS server error: ${error.message}`, gameId);
-            resolve({ server: null, isHTTPS: false });
-          });
-        } catch (error) {
-          log(
-            `❌ SSL setup failed, falling back to HTTP: ${error.message}`,
-            gameId
-          );
-          const httpServer = app.listen(PORT, "0.0.0.0", () => {
-            log(`🚀 HTTP Game Server running on port ${PORT}`, gameId);
-            log(`🌍 Access at: http://localhost:${PORT}`, gameId);
-            resolve({ server: httpServer, isHTTPS: false });
-          });
-          httpServer.on("error", (error) => {
-            log(`❌ HTTP server error: ${error.message}`, gameId);
-            resolve({ server: null, isHTTPS: false });
-          });
-        }
-      } else {
-        log(`🌐 Setting up HTTP server...`, gameId);
-        const httpServer = app.listen(PORT, "0.0.0.0", () => {
-          log(`🚀 HTTP Game Server running on port ${PORT}`, gameId);
-          log(`🌍 Access at: http://localhost:${PORT}`, gameId);
-          resolve({ server: httpServer, isHTTPS: false });
-        });
-        httpServer.on("error", (error) => {
-          log(`❌ HTTP server error: ${error.message}`, gameId);
-          resolve({ server: null, isHTTPS: false });
-        });
-      }
-    });
+    if (serverResult.server) {
+      // Register the instance in our global registry
+      activeGameServers.set(gameId, gameServerInstance);
+      log(`✅ Game server started successfully for game ${gameId}!`, gameId);
+      return serverResult;
+    } else {
+      log(`❌ Failed to start game server for game ${gameId}`, gameId);
+      return { server: null, isHTTPS: false };
+    }
   } catch (error) {
     log(`❌ Error initializing game server: ${error.message}`, gameId);
-    log(`📍 Stack trace: ${error.stack}`, gameId);
     return { server: null, isHTTPS: false };
   }
 }
 
-// Clean up game server state
-export function cleanupGameServer() {
-  gameMap = null;
-  players = [];
-  playerPositions.clear();
-  playerStats.clear();
-  revealSeed = null;
-  gameStartTime = null;
+export function cleanupGameServer(gameId) {
+  const gameServerInstance = activeGameServers.get(gameId);
+  if (gameServerInstance) {
+    gameServerInstance.cleanup();
+    activeGameServers.delete(gameId);
+  }
+}
 
-  if (gameTimerInterval) {
-    clearTimeout(gameTimerInterval);
-    gameTimerInterval = null;
+export function getCurrentPlayerData(gameId) {
+  const gameServerInstance = activeGameServers.get(gameId);
+  if (gameServerInstance) {
+    return gameServerInstance.getCurrentPlayerData();
+  }
+  return [];
+}
+
+export function getTimeRemaining(gameId) {
+  const gameServerInstance = activeGameServers.get(gameId);
+  if (gameServerInstance) {
+    return gameServerInstance.getTimeRemaining();
+  }
+  return 0;
+}
+
+export function forceFinishGameOnTimer(gameId) {
+  const gameServerInstance = activeGameServers.get(gameId);
+  if (gameServerInstance) {
+    gameServerInstance.forceFinishGameOnTimer();
+  }
+}
+
+export function getActiveGameServers() {
+  return Array.from(activeGameServers.keys());
+}
+
+export function getGameServerInfo(gameId) {
+  const gameServerInstance = activeGameServers.get(gameId);
+  if (gameServerInstance) {
+    return {
+      gameId: gameServerInstance.gameId,
+      port: gameServerInstance.port,
+      playerCount: gameServerInstance.players.length,
+      gameLoaded: gameServerInstance.gameMap !== null,
+      gameStartTime: gameServerInstance.gameStartTime,
+      timeRemaining: gameServerInstance.getTimeRemaining(),
+    };
+  }
+  return null;
+}
+
+// Generate URL for a specific game server
+export function generateGameServerUrl(gameId, isHTTPS = false) {
+  const port = 8000 + parseInt(gameId);
+  const baseUrl = process.env.GAME_API_BASE || "http://localhost";
+
+  // If we have GAME_API_BASE set and it includes protocol, use it as-is
+  // Otherwise, use the isHTTPS parameter to determine protocol
+  if (baseUrl.startsWith("http://") || baseUrl.startsWith("https://")) {
+    return `${baseUrl}:${port}`;
+  } else {
+    const protocol = isHTTPS ? "https" : "http";
+    return `${protocol}://${baseUrl}:${port}`;
   }
 }
