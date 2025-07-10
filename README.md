@@ -1,6 +1,6 @@
-# Admin Script - Blockchain Game Management System
+# Verifiable Backend 
 
-A comprehensive blockchain-based game management system with DeFi utility scripts for Base network (mainnet and fork).
+## [https://cryptohunter.fun](https://cryptohunter.fun/)
 
 ## 🎮 Core Features
 
