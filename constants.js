@@ -29,7 +29,7 @@ export const TILE_POINTS = {
   1: 1, // Common
   2: 5, // Uncommon
   3: 10, // Rare
-  X: 25, // Starting position (ultra rare)
+  X: 25, // Treasure (ultra rare)
 };
 
 // Movement directions

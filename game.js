@@ -181,12 +181,12 @@ async function startGameServer(gameId) {
     const dice = new DeterministicDice(randomHash);
     const mapGenerator = new GameLandGenerator(dice, contractMapSize);
     mapGenerator.generateLand();
-    mapGenerator.placeStartingPosition();
+    mapGenerator.placeTreasure();
 
     const mapData = {
       size: mapGenerator.size,
       land: mapGenerator.land,
-      startingPosition: mapGenerator.startingPosition,
+      treasure: mapGenerator.treasure,
       metadata: {
         generated: new Date().toISOString(),
         gameId: gameId,

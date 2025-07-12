@@ -1,4 +1,4 @@
-# Verifiable Backend 
+# Verifiable Backend
 
 ## [https://cryptohunter.fun](https://cryptohunter.fun/)
 
@@ -108,7 +108,7 @@ This starts the automated game management system that:
 - **Common (1)**: 1 point
 - **Uncommon (2)**: 5 points
 - **Rare (3)**: 10 points
-- **Starting Position (X)**: 25 points
+- **Treasure (X)**: 25 points
 
 ## 🌐 Game Server API
 

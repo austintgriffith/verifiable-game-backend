@@ -48,7 +48,7 @@ LAND TYPES
 1 = Common land (1 point when mined)
 2 = Uncommon land (5 points when mined)
 3 = Rare land (10 points when mined)
-X = Starting position marker
+X = Treasure marker
 
 MOVEMENT DIRECTIONS
 ------------------
@@ -244,7 +244,7 @@ Response:
     "1": "Common (1 point)",
     "2": "Uncommon (5 points)",
     "3": "Rare (10 points)",
-    "X": "Starting Position"
+    "X": "Treasure!!! (25 points)"
   }
 }
 
