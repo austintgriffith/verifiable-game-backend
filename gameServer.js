@@ -376,6 +376,14 @@ class GameServerInstance {
     const pointsEarned = TILE_POINTS[currentTile] || 0;
     stats.score += pointsEarned;
     stats.minesRemaining--;
+
+    // Check if this was the final mining action and award bonus for remaining moves
+    let bonusPoints = 0;
+    if (stats.minesRemaining === 0 && stats.movesRemaining > 0) {
+      bonusPoints = stats.movesRemaining;
+      stats.score += bonusPoints;
+    }
+
     this.playerStats.set(playerAddress.toLowerCase(), stats);
 
     this.gameMap.land[currentPos.y][currentPos.x] = 0;
@@ -385,6 +393,7 @@ class GameServerInstance {
       position: currentPos,
       tile: currentTile,
       pointsEarned,
+      bonusPoints,
       totalScore: stats.score,
       minesRemaining: stats.minesRemaining,
       movesRemaining: stats.movesRemaining,
@@ -583,6 +592,7 @@ class GameServerInstance {
         position: mineResult.position,
         tile: mineResult.tile,
         pointsEarned: mineResult.pointsEarned,
+        bonusPoints: mineResult.bonusPoints,
         totalScore: mineResult.totalScore,
         movesRemaining: mineResult.movesRemaining,
         minesRemaining: mineResult.minesRemaining,

@@ -109,6 +109,7 @@ This starts the automated game management system that:
 - **Uncommon (2)**: 5 points
 - **Rare (3)**: 10 points
 - **Treasure (X)**: 25 points
+- **Bonus**: +1 point per unused move when completing final mining action
 
 ## 🌐 Game Server API
 

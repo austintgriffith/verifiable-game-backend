@@ -35,6 +35,14 @@ Land types have different point values when mined:
 - Common land (1): 1 point
 - Uncommon land (2): 5 points  
 - Rare land (3): 10 points
+- Treasure land (X): 25 points
+
+BONUS SCORING
+-------------
+When a player uses their final (3rd) mining action and still has moves remaining:
+- They receive 1 bonus point for each unused move
+- Example: Player completes all 3 mines with 6 moves left = +6 bonus points
+- This rewards efficient exploration and early treasure finding
 
 AUTHENTICATION
 --------------
@@ -320,7 +328,7 @@ Authorization: Bearer <jwt_token>
 Request Body: (empty - no parameters needed)
 {}
 
-Example: POST /mine
+Example: POST /mine (Final mining action with bonus points)
 
 Response:
 {
@@ -329,7 +337,8 @@ Response:
   "position": {"x": 7, "y": 3},
   "tile": 2,
   "pointsEarned": 5,
-  "totalScore": 20,
+  "bonusPoints": 7,
+  "totalScore": 27,
   "movesRemaining": 7,
   "minesRemaining": 0,
   "timeRemaining": 65,
