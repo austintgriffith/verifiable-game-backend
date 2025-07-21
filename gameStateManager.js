@@ -148,7 +148,8 @@ export async function processGamePhase(
   completedGamesCount,
   startGameServerFn,
   monitorGameProgressFn,
-  stopGameServerFn
+  stopGameServerFn,
+  pendingTransactions = null
 ) {
   const gameState = await updateGameState(
     gameId,
@@ -224,7 +225,8 @@ export async function processGamePhase(
         gameId,
         globalPublicClient,
         globalWalletClient,
-        globalContractAddress
+        globalContractAddress,
+        pendingTransactions
       );
       if (commitSuccess) {
         log(`✅ Commit phase completed`, gameId);
@@ -245,7 +247,8 @@ export async function processGamePhase(
           globalPublicClient,
           globalWalletClient,
           globalContractAddress,
-          lastWaitingLogs
+          lastWaitingLogs,
+          pendingTransactions
         );
         if (storeSuccess) {
           log(`✅ Block hash storage completed`, gameId);
@@ -455,6 +458,11 @@ export async function processGamePhase(
       payoutLastRetryTime.delete(gameId);
       revealRetryCount.delete(gameId);
       revealLastRetryTime.delete(gameId);
+
+      // Clean up pending transactions for this game
+      if (pendingTransactions) {
+        pendingTransactions.delete(gameId);
+      }
 
       const keysToDelete = [];
       for (const [key, value] of lastWaitingLogs.entries()) {

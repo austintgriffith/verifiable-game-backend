@@ -14,10 +14,50 @@ export async function commitHashForGame(
   gameId,
   globalPublicClient,
   globalWalletClient,
-  globalContractAddress
+  globalContractAddress,
+  pendingTransactions = null
 ) {
   try {
     log(`Starting commit phase...`, gameId);
+
+    // Check if we already have a pending commit transaction for this game
+    const gameTransactions = pendingTransactions?.get(gameId) || {};
+    if (gameTransactions.commitTx) {
+      log(
+        `Commit transaction already pending: ${gameTransactions.commitTx}`,
+        gameId
+      );
+
+      // Check if the pending transaction is still valid
+      try {
+        const receipt = await globalPublicClient.getTransactionReceipt({
+          hash: gameTransactions.commitTx,
+        });
+        if (receipt.status === "success") {
+          log(`Previous commit transaction confirmed successfully`, gameId);
+          // Clear the pending transaction and wait for state to update
+          delete gameTransactions.commitTx;
+          if (pendingTransactions) {
+            pendingTransactions.set(gameId, gameTransactions);
+          }
+          return await waitForCommitStateUpdate(
+            gameId,
+            globalPublicClient,
+            globalContractAddress
+          );
+        } else {
+          log(`Previous commit transaction failed, will retry`, gameId);
+          delete gameTransactions.commitTx;
+          if (pendingTransactions) {
+            pendingTransactions.set(gameId, gameTransactions);
+          }
+        }
+      } catch (receiptError) {
+        // Transaction might still be pending
+        log(`Previous commit transaction still pending, waiting...`, gameId);
+        return false;
+      }
+    }
 
     const currentState = await globalPublicClient.readContract({
       address: globalContractAddress,
@@ -36,13 +76,8 @@ export async function commitHashForGame(
     }
 
     if (hasCommitted && !hasStoredBlockHash) {
-      log(`Hash already committed, attempting to store block hash...`, gameId);
-      return await storeCommitBlockHashForGame(
-        gameId,
-        globalPublicClient,
-        globalWalletClient,
-        globalContractAddress
-      );
+      log(`Hash already committed, no need to commit again`, gameId);
+      return true;
     }
 
     const revealBytes32 = generateRandomReveal();
@@ -63,34 +98,56 @@ export async function commitHashForGame(
 
     log(`Commit transaction: ${commitTxHash}`, gameId);
 
+    // Track this transaction to prevent duplicates
+    if (pendingTransactions) {
+      const gameTransactions = pendingTransactions.get(gameId) || {};
+      gameTransactions.commitTx = commitTxHash;
+      pendingTransactions.set(gameId, gameTransactions);
+    }
+
     const receipt = await globalPublicClient.waitForTransactionReceipt({
       hash: commitTxHash,
     });
+
+    // Clear the pending transaction
+    if (pendingTransactions) {
+      const gameTransactions = pendingTransactions.get(gameId) || {};
+      delete gameTransactions.commitTx;
+      pendingTransactions.set(gameId, gameTransactions);
+    }
 
     if (receipt.status === "success") {
       log(`Commit successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
       log(`Game is now open for players to join`, gameId);
 
-      // Base has 200ms block times, so we only need to wait ~500ms for 2-3 blocks
-      log(
-        `Scheduling block hash storage in 500ms (optimized for Base)...`,
-        gameId
+      // Wait for the contract state to reflect the change
+      const stateUpdated = await waitForCommitStateUpdate(
+        gameId,
+        globalPublicClient,
+        globalContractAddress
       );
-      setTimeout(async () => {
-        await storeCommitBlockHashForGame(
-          gameId,
-          globalPublicClient,
-          globalWalletClient,
-          globalContractAddress
+      if (stateUpdated) {
+        log(`✅ Commit phase completed`, gameId);
+        return true;
+      } else {
+        log(
+          `⚠️ Commit transaction succeeded but state not updated yet`,
+          gameId
         );
-      }, 500);
-
-      return true;
+        return true; // Still consider it successful
+      }
     } else {
       log(`Commit failed!`, gameId);
       return false;
     }
   } catch (error) {
+    // Clear any pending transaction on error
+    if (pendingTransactions) {
+      const gameTransactions = pendingTransactions.get(gameId) || {};
+      delete gameTransactions.commitTx;
+      pendingTransactions.set(gameId, gameTransactions);
+    }
+
     if (
       error.message.includes("Sender doesn't have enough funds") ||
       error.message.includes("insufficient funds")
@@ -119,17 +176,111 @@ export async function commitHashForGame(
   }
 }
 
+// Helper function to wait for commit state to be reflected on-chain
+async function waitForCommitStateUpdate(
+  gameId,
+  globalPublicClient,
+  globalContractAddress,
+  maxAttempts = 5,
+  delayMs = 1000
+) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const currentState = await globalPublicClient.readContract({
+        address: globalContractAddress,
+        abi: FULL_CONTRACT_ABI,
+        functionName: "getCommitRevealState",
+        args: [BigInt(gameId)],
+      });
+
+      const [, , , , hasCommitted] = currentState;
+      if (hasCommitted) {
+        log(`✅ Commit state confirmed on-chain (attempt ${attempt})`, gameId);
+        return true;
+      }
+
+      if (attempt < maxAttempts) {
+        log(
+          `⏳ Waiting for commit state update (attempt ${attempt}/${maxAttempts})`,
+          gameId
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    } catch (error) {
+      log(
+        `⚠️ Error checking commit state (attempt ${attempt}): ${error.message}`,
+        gameId
+      );
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  log(`⚠️ Commit state not confirmed after ${maxAttempts} attempts`, gameId);
+  return false;
+}
+
 export async function storeCommitBlockHashForGame(
   gameId,
   globalPublicClient,
   globalWalletClient,
   globalContractAddress,
-  lastWaitingLogs = null
+  lastWaitingLogs = null,
+  pendingTransactions = null
 ) {
   try {
     const blockHashStartKey = `block_hash_start_${gameId}`;
     if (shouldLogWaitingMessage(blockHashStartKey, lastWaitingLogs)) {
       log(`Starting block hash storage...`, gameId);
+    }
+
+    // Check if we already have a pending block hash storage transaction
+    const gameTransactions = pendingTransactions?.get(gameId) || {};
+    if (gameTransactions.storeBlockHashTx) {
+      log(
+        `Block hash storage transaction already pending: ${gameTransactions.storeBlockHashTx}`,
+        gameId
+      );
+
+      // Check if the pending transaction is still valid
+      try {
+        const receipt = await globalPublicClient.getTransactionReceipt({
+          hash: gameTransactions.storeBlockHashTx,
+        });
+        if (receipt.status === "success") {
+          log(
+            `Previous block hash storage transaction confirmed successfully`,
+            gameId
+          );
+          // Clear the pending transaction and wait for state to update
+          delete gameTransactions.storeBlockHashTx;
+          if (pendingTransactions) {
+            pendingTransactions.set(gameId, gameTransactions);
+          }
+          return await waitForBlockHashStateUpdate(
+            gameId,
+            globalPublicClient,
+            globalContractAddress
+          );
+        } else {
+          log(
+            `Previous block hash storage transaction failed, will retry`,
+            gameId
+          );
+          delete gameTransactions.storeBlockHashTx;
+          if (pendingTransactions) {
+            pendingTransactions.set(gameId, gameTransactions);
+          }
+        }
+      } catch (receiptError) {
+        // Transaction might still be pending
+        log(
+          `Previous block hash storage transaction still pending, waiting...`,
+          gameId
+        );
+        return false;
+      }
     }
 
     const currentState = await globalPublicClient.readContract({
@@ -187,9 +338,23 @@ export async function storeCommitBlockHashForGame(
 
     log(`Store block hash transaction: ${storeTxHash}`, gameId);
 
+    // Track this transaction to prevent duplicates
+    if (pendingTransactions) {
+      const gameTransactions = pendingTransactions.get(gameId) || {};
+      gameTransactions.storeBlockHashTx = storeTxHash;
+      pendingTransactions.set(gameId, gameTransactions);
+    }
+
     const receipt = await globalPublicClient.waitForTransactionReceipt({
       hash: storeTxHash,
     });
+
+    // Clear the pending transaction
+    if (pendingTransactions) {
+      const gameTransactions = pendingTransactions.get(gameId) || {};
+      delete gameTransactions.storeBlockHashTx;
+      pendingTransactions.set(gameId, gameTransactions);
+    }
 
     if (receipt.status === "success") {
       log(
@@ -198,12 +363,35 @@ export async function storeCommitBlockHashForGame(
       );
       log(`Game server URL stored in contract: ${gameServerUrl}`, gameId);
       log(`Commit phase fully completed - game ready for closure`, gameId);
-      return true;
+
+      // Wait for the contract state to reflect the change
+      const stateUpdated = await waitForBlockHashStateUpdate(
+        gameId,
+        globalPublicClient,
+        globalContractAddress
+      );
+      if (stateUpdated) {
+        log(`✅ Block hash storage completed`, gameId);
+        return true;
+      } else {
+        log(
+          `⚠️ Block hash storage transaction succeeded but state not updated yet`,
+          gameId
+        );
+        return true; // Still consider it successful
+      }
     } else {
       log(`Block hash storage failed!`, gameId);
       return false;
     }
   } catch (error) {
+    // Clear any pending transaction on error
+    if (pendingTransactions) {
+      const gameTransactions = pendingTransactions.get(gameId) || {};
+      delete gameTransactions.storeBlockHashTx;
+      pendingTransactions.set(gameId, gameTransactions);
+    }
+
     if (
       error.message.includes("Commit block hash not available") ||
       error.message.includes("too old") ||
@@ -232,6 +420,57 @@ export async function storeCommitBlockHashForGame(
       return false;
     }
   }
+}
+
+// Helper function to wait for block hash storage state to be reflected on-chain
+async function waitForBlockHashStateUpdate(
+  gameId,
+  globalPublicClient,
+  globalContractAddress,
+  maxAttempts = 5,
+  delayMs = 1000
+) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const currentState = await globalPublicClient.readContract({
+        address: globalContractAddress,
+        abi: FULL_CONTRACT_ABI,
+        functionName: "getCommitRevealState",
+        args: [BigInt(gameId)],
+      });
+
+      const [, , , , hasCommitted, , hasStoredBlockHash] = currentState;
+      if (hasCommitted && hasStoredBlockHash) {
+        log(
+          `✅ Block hash storage state confirmed on-chain (attempt ${attempt})`,
+          gameId
+        );
+        return true;
+      }
+
+      if (attempt < maxAttempts) {
+        log(
+          `⏳ Waiting for block hash storage state update (attempt ${attempt}/${maxAttempts})`,
+          gameId
+        );
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    } catch (error) {
+      log(
+        `⚠️ Error checking block hash storage state (attempt ${attempt}): ${error.message}`,
+        gameId
+      );
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  log(
+    `⚠️ Block hash storage state not confirmed after ${maxAttempts} attempts`,
+    gameId
+  );
+  return false;
 }
 
 export async function payoutGame(

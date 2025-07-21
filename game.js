@@ -42,6 +42,8 @@ let payoutRetryCount = new Map();
 let payoutLastRetryTime = new Map();
 let revealRetryCount = new Map();
 let revealLastRetryTime = new Map();
+// Add transaction tracking to prevent duplicate operations
+let pendingTransactions = new Map(); // gameId -> { commitTx?, storeBlockHashTx?, revealTx?, payoutTx? }
 let globalAccount = null;
 let globalPublicClient = null;
 let globalWalletClient = null;
@@ -292,6 +294,9 @@ async function stopGameServer(gameId) {
   payoutLastRetryTime.delete(gameId);
   revealRetryCount.delete(gameId);
   revealLastRetryTime.delete(gameId);
+
+  // Clean up pending transactions for this game
+  pendingTransactions.delete(gameId);
 }
 
 // Stop all game servers
@@ -398,7 +403,8 @@ async function gameLoop() {
             completedGamesCount,
             startGameServer,
             monitorGameProgressWrapper,
-            stopGameServer
+            stopGameServer,
+            pendingTransactions
           );
 
           // Check if the game was completed and server should be stopped
