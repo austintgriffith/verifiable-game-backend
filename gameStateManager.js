@@ -31,6 +31,13 @@ export async function updateGameState(
   activeGameServer
 ) {
   try {
+    // Check if this game has already been marked as expired
+    const currentState = gameStates.get(gameId) || {};
+    if (currentState.expired) {
+      log(`⏭️ Game already marked as expired, skipping state update`, gameId);
+      return currentState;
+    }
+
     const gameInfo = await globalPublicClient.readContract({
       address: globalContractAddress,
       abi: FULL_CONTRACT_ABI,
@@ -97,8 +104,6 @@ export async function updateGameState(
     } else if (hasCommitted) {
       phase = GamePhase.COMMITTED;
     }
-
-    const currentState = gameStates.get(gameId) || {};
 
     if (currentState.payoutSkipped && phase === GamePhase.GAME_FINISHED) {
       phase = GamePhase.PAYOUT_COMPLETE;
