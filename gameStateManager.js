@@ -287,11 +287,17 @@ export async function processGamePhase(
         const serverStarted = await startGameServerFn(gameId);
         if (!serverStarted) {
           const updatedGameState = gameStates.get(gameId);
-          if (updatedGameState) {
+          // Only override phase if game wasn't marked as expired
+          if (updatedGameState && !updatedGameState.expired) {
             updatedGameState.phase = GamePhase.GAME_FINISHED;
             gameStates.set(gameId, updatedGameState);
             log(
               `📊 Game phase updated to GAME_FINISHED (already completed)`,
+              gameId
+            );
+          } else if (updatedGameState && updatedGameState.expired) {
+            log(
+              `⏭️ Game was marked as expired, keeping COMPLETE phase`,
               gameId
             );
           }
