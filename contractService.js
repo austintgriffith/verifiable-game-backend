@@ -71,7 +71,11 @@ export async function commitHashForGame(
       log(`Commit successful! Gas used: ${receipt.gasUsed.toString()}`, gameId);
       log(`Game is now open for players to join`, gameId);
 
-      log(`Scheduling block hash storage in 15 seconds...`, gameId);
+      // Base has 200ms block times, so we only need to wait ~500ms for 2-3 blocks
+      log(
+        `Scheduling block hash storage in 500ms (optimized for Base)...`,
+        gameId
+      );
       setTimeout(async () => {
         await storeCommitBlockHashForGame(
           gameId,
@@ -79,7 +83,7 @@ export async function commitHashForGame(
           globalWalletClient,
           globalContractAddress
         );
-      }, 15000);
+      }, 500);
 
       return true;
     } else {
@@ -422,7 +426,7 @@ export async function revealGame(
     const lastRetryTime = revealLastRetryTime.get(gameId) || 0;
     const now = Date.now();
     const MAX_RETRIES = 1;
-    const RETRY_BACKOFF_MS = 10000;
+    const RETRY_BACKOFF_MS = 2000; // Reduced from 10s to 2s for Base's 200ms blocks
 
     if (retryCount >= MAX_RETRIES) {
       log(`❌ Reveal failed after ${MAX_RETRIES} retries - giving up`, gameId);
@@ -507,7 +511,7 @@ export async function revealGame(
         gameId
       );
 
-      const BACKOFF_MS = 10000;
+      const BACKOFF_MS = 2000; // Reduced from 10s to 2s for Base's 200ms blocks
       log(
         `⏳ Will retry in ${Math.round(BACKOFF_MS / 1000)} seconds...`,
         gameId

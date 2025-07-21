@@ -361,7 +361,7 @@ export async function processGamePhase(
       const currentTime = Date.now();
 
       if (currentRevealRetryCount > 0) {
-        const RETRY_BACKOFF_MS = 10000;
+        const RETRY_BACKOFF_MS = 2000; // Reduced from 10s to 2s for Base's 200ms blocks
         const timeUntilRetry = Math.max(
           0,
           RETRY_BACKOFF_MS - (currentTime - currentRevealLastRetryTime)
@@ -412,7 +412,7 @@ export async function processGamePhase(
         }
         log(`✅ Reveal phase completed`, gameId);
 
-        log(`⏲️ Scheduling game server shutdown in 15 seconds...`, gameId);
+        log(`⏲️ Scheduling game server shutdown in 3 seconds...`, gameId);
         setTimeout(async () => {
           if (activeGameServer === gameId) {
             log(
@@ -426,7 +426,7 @@ export async function processGamePhase(
               gameId
             );
           }
-        }, 15000);
+        }, 3000); // Reduced from 15s to 3s for Base's fast block times
       } else {
         const newRetryCount = revealRetryCount.get(gameId) || 0;
         if (newRetryCount < 1) {
